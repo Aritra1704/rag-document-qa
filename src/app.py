@@ -1,6 +1,6 @@
 """
 RAG Document Q&A Application
-Main Streamlit application file
+Enhanced with Demo Mode and Interactive UI
 """
 
 import streamlit as st
@@ -27,6 +27,51 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Custom CSS for better UI
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 1rem;
+    }
+    .sub-header {
+        font-size: 1.2rem;
+        text-align: center;
+        color: #666;
+        margin-bottom: 2rem;
+    }
+    .demo-box {
+        background-color: #f0f7ff;
+        padding: 20px;
+        border-radius: 10px;
+        border: 2px solid #1f77b4;
+        margin: 20px 0;
+    }
+    .feature-card {
+        background-color: #f9f9f9;
+        padding: 15px;
+        border-radius: 8px;
+        border-left: 4px solid #1f77b4;
+        margin: 10px 0;
+    }
+    .step-number {
+        background-color: #1f77b4;
+        color: white;
+        border-radius: 50%;
+        width: 30px;
+        height: 30px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: bold;
+        margin-right: 10px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # Initialize session state
 if 'documents_processed' not in st.session_state:
     st.session_state.documents_processed = False
@@ -38,6 +83,60 @@ if 'chunk_count' not in st.session_state:
     st.session_state.chunk_count = 0
 if 'file_count' not in st.session_state:
     st.session_state.file_count = 0
+if 'demo_mode' not in st.session_state:
+    st.session_state.demo_mode = False
+if 'show_tutorial' not in st.session_state:
+    st.session_state.show_tutorial = True
+
+# Demo document content
+DEMO_DOCUMENT = """
+Machine Learning Fundamentals
+
+What is Machine Learning?
+Machine learning is a subset of artificial intelligence that enables systems to learn and improve from experience without being explicitly programmed. It focuses on developing computer programs that can access data and use it to learn for themselves.
+
+Types of Machine Learning:
+
+1. Supervised Learning
+Supervised learning uses labeled training data to learn the mapping between input and output. Common applications include image classification, spam detection, and price prediction. Popular algorithms include Linear Regression, Decision Trees, and Neural Networks.
+
+2. Unsupervised Learning  
+Unsupervised learning works with unlabeled data to find hidden patterns. It includes techniques like clustering (K-Means) and dimensionality reduction (PCA). Use cases include customer segmentation and anomaly detection.
+
+3. Reinforcement Learning
+Reinforcement learning involves an agent learning through trial and error by receiving rewards or penalties. It's used in robotics, game playing (like AlphaGo), and autonomous vehicles.
+
+Deep Learning
+Deep learning uses neural networks with multiple layers to automatically learn hierarchical representations of data. It has revolutionized computer vision, natural language processing, and speech recognition.
+
+Key Components:
+- Neural Networks: Input layer, hidden layers, output layer
+- Activation Functions: ReLU, Sigmoid, Tanh
+- Optimization: Gradient descent, Adam, RMSprop
+- Regularization: Dropout, Batch Normalization
+
+Real-World Applications:
+- Healthcare: Disease diagnosis, drug discovery
+- Finance: Fraud detection, algorithmic trading
+- E-commerce: Product recommendations, price optimization
+- Transportation: Autonomous vehicles, route optimization
+- Manufacturing: Quality control, predictive maintenance
+
+Best Practices:
+1. Start with high-quality, representative data
+2. Split data into training, validation, and test sets
+3. Use cross-validation to assess model performance
+4. Apply regularization to prevent overfitting
+5. Monitor model performance in production
+6. Consider ethical implications and bias
+
+Challenges:
+- Data quality and quantity requirements
+- Computational resource demands
+- Model interpretability
+- Bias and fairness concerns
+- Keeping models updated with new data
+"""
 
 class DocumentProcessor:
     """Handles document extraction and processing"""
@@ -211,6 +310,35 @@ Answer:"""
             logger.error(f"Error generating answer: {e}")
             raise
 
+def load_demo_mode():
+    """Load demo document into the system"""
+    try:
+        # Initialize vector store
+        vector_store = VectorStore()
+        collection = vector_store.initialize_collection("demo")
+        
+        # Process demo document
+        doc_processor = DocumentProcessor()
+        chunks = doc_processor.chunk_text(DEMO_DOCUMENT)
+        
+        # Add to vector store
+        metadatas = [{"source": "Machine_Learning_Guide.txt"} for _ in chunks]
+        ids = [f"demo_chunk_{i}" for i in range(len(chunks))]
+        vector_store.add_documents(chunks, metadatas, ids)
+        
+        # Update session state
+        st.session_state.collection = collection
+        st.session_state.documents_processed = True
+        st.session_state.demo_mode = True
+        st.session_state.chunk_count = len(chunks)
+        st.session_state.file_count = 1
+        st.session_state.chat_history = []
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error loading demo: {e}")
+        return False
+
 def process_documents(uploaded_files, api_key: str):
     """Process uploaded documents and store in vector database"""
     try:
@@ -258,8 +386,10 @@ def process_documents(uploaded_files, api_key: str):
             
             st.session_state.collection = collection
             st.session_state.documents_processed = True
+            st.session_state.demo_mode = False
             st.session_state.chunk_count = len(all_chunks)
             st.session_state.file_count = len(uploaded_files)
+            st.session_state.chat_history = []
             
             status_text.text("")
             progress_bar.empty()
@@ -276,15 +406,144 @@ def process_documents(uploaded_files, api_key: str):
         st.sidebar.error(f"Error processing documents: {str(e)}")
         logger.error(f"Document processing error: {e}")
 
+def show_landing_page():
+    """Display landing page with demo and tutorial"""
+    
+    st.markdown('<div class="main-header">🤖 RAG Document Q&A System</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Ask questions about your documents using AI-powered Retrieval-Augmented Generation</div>', unsafe_allow_html=True)
+    
+    # Demo Mode Button
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        if st.button("🎮 Try Demo Mode", type="primary", use_container_width=True):
+            with st.spinner("Loading demo document..."):
+                if load_demo_mode():
+                    st.success("✅ Demo loaded! Try asking questions below.")
+                    st.rerun()
+    
+    st.markdown("---")
+    
+    # What is RAG?
+    with st.expander("🧠 What is RAG (Retrieval-Augmented Generation)?", expanded=True):
+        st.markdown("""
+        <div class="feature-card">
+        <h3>The Problem</h3>
+        Regular AI chatbots can only answer based on their training data. They don't have access to YOUR documents and may "hallucinate" (make up) answers when they don't know something.
+        </div>
+        
+        <div class="feature-card">
+        <h3>The Solution: RAG</h3>
+        RAG combines document retrieval with AI generation to give accurate, grounded answers from YOUR documents.
+        </div>
+        """, unsafe_allow_html=True)
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown("**📄 1. Upload Documents**")
+            st.write("Add your PDFs, Word docs, or text files")
+        
+        with col2:
+            st.markdown("**🔍 2. Smart Search**")
+            st.write("System finds relevant sections automatically")
+        
+        with col3:
+            st.markdown("**💬 3. AI Answers**")
+            st.write("Get accurate answers with source citations")
+    
+    # How It Works
+    with st.expander("⚙️ How Does It Work?"):
+        st.markdown("""
+        <div class="demo-box">
+        <h3>The RAG Pipeline</h3>
+        """, unsafe_allow_html=True)
+        
+        steps = [
+            ("Document Processing", "Your documents are split into smaller chunks"),
+            ("Embeddings", "Text is converted to vectors (numbers that capture meaning)"),
+            ("Vector Storage", "Stored in a database for fast semantic search"),
+            ("Query Processing", "Your question is also converted to a vector"),
+            ("Retrieval", "System finds the most relevant document chunks"),
+            ("Generation", "AI reads the relevant chunks and generates an answer"),
+            ("Citation", "Shows which documents were used")
+        ]
+        
+        for i, (title, desc) in enumerate(steps, 1):
+            st.markdown(f"""
+            <div style="display: flex; align-items: center; margin: 10px 0;">
+                <span class="step-number">{i}</span>
+                <div>
+                    <strong>{title}</strong><br>
+                    <span style="color: #666;">{desc}</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Features
+    with st.expander("✨ Key Features"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("""
+            - ✅ **Multi-format Support**: PDF, Word, TXT
+            - ✅ **Semantic Search**: Understands meaning, not just keywords
+            - ✅ **Source Citations**: See which documents were used
+            - ✅ **Chat Interface**: Natural conversation flow
+            """)
+        
+        with col2:
+            st.markdown("""
+            - ✅ **No Hallucinations**: Answers based on your documents
+            - ✅ **Privacy-First**: Documents processed locally
+            - ✅ **Fast & Accurate**: Get answers in seconds
+            - ✅ **Easy to Use**: No technical knowledge required
+            """)
+    
+    # Use Cases
+    with st.expander("🎯 Use Cases"):
+        use_cases = [
+            ("📚 Research", "Query research papers, academic articles, and study materials"),
+            ("💼 Business", "Search through reports, policies, and documentation"),
+            ("⚖️ Legal", "Find specific clauses in contracts and legal documents"),
+            ("🏥 Healthcare", "Access medical guidelines and research"),
+            ("📖 Education", "Study materials and course content"),
+            ("🔧 Technical", "API docs, manuals, and technical specifications")
+        ]
+        
+        cols = st.columns(3)
+        for i, (title, desc) in enumerate(use_cases):
+            with cols[i % 3]:
+                st.markdown(f"""
+                <div class="feature-card">
+                <h4>{title}</h4>
+                <p>{desc}</p>
+                </div>
+                """, unsafe_allow_html=True)
+    
+    # Demo Examples
+    st.markdown("---")
+    st.markdown("### 🎮 Try Demo Mode to Ask Questions Like:")
+    
+    demo_questions = [
+        "What is machine learning?",
+        "What are the types of machine learning?",
+        "What is deep learning?",
+        "What are some real-world applications?",
+        "What are the key challenges in machine learning?"
+    ]
+    
+    cols = st.columns(2)
+    for i, question in enumerate(demo_questions):
+        with cols[i % 2]:
+            st.info(f"❓ {question}")
+    
+    st.markdown("---")
+    st.markdown("### 📤 Or Upload Your Own Documents in the Sidebar")
+
 def main():
     """Main application function"""
-    
-    st.title("🤖 RAG Document Q&A System")
-    
-    st.markdown("""
-    Ask questions about your documents using **Retrieval-Augmented Generation (RAG)**.
-    Upload PDFs, Word docs, or text files to get started.
-    """)
     
     # Sidebar configuration
     with st.sidebar:
@@ -300,8 +559,20 @@ def main():
         
         st.divider()
         
+        # Mode Selection
+        if not st.session_state.documents_processed:
+            st.header("🚀 Get Started")
+            
+            if st.button("🎮 Try Demo Mode", type="secondary", use_container_width=True):
+                with st.spinner("Loading demo..."):
+                    if load_demo_mode():
+                        st.success("✅ Demo loaded!")
+                        st.rerun()
+            
+            st.markdown("**OR**")
+        
         # Document upload
-        st.header("📄 Upload Documents")
+        st.header("📄 Upload Your Documents")
         uploaded_files = st.file_uploader(
             "Choose files",
             accept_multiple_files=True,
@@ -316,47 +587,47 @@ def main():
             else:
                 with st.spinner("Processing documents..."):
                     process_documents(uploaded_files, api_key)
+                    st.rerun()
         
         # Stats
         if st.session_state.documents_processed:
             st.divider()
-            st.metric("Files Processed", st.session_state.file_count)
+            
+            if st.session_state.demo_mode:
+                st.info("📌 Demo Mode Active")
+            
+            st.metric("Files Loaded", st.session_state.file_count)
             st.metric("Text Chunks", st.session_state.chunk_count)
             
-            if st.button("Clear Documents", type="secondary"):
+            if st.button("🔄 Reset", type="secondary"):
                 st.session_state.documents_processed = False
                 st.session_state.collection = None
                 st.session_state.chat_history = []
                 st.session_state.chunk_count = 0
                 st.session_state.file_count = 0
+                st.session_state.demo_mode = False
                 st.rerun()
     
-    # Main chat interface
+    # Main content area
     if not st.session_state.documents_processed:
-        st.info("👈 Upload documents in the sidebar to get started!")
-        
-        # Show example
-        with st.expander("📖 How RAG Works"):
-            st.markdown("""
-            ### The RAG Pipeline
-            
-            1. **Document Processing**: Upload your documents
-            2. **Chunking**: Text is split into manageable pieces
-            3. **Embeddings**: Chunks are converted to vectors
-            4. **Storage**: Vectors stored in database (ChromaDB)
-            5. **Query**: You ask a question
-            6. **Retrieval**: System finds relevant chunks
-            7. **Generation**: Claude answers using retrieved context
-            
-            ### Why RAG?
-            
-            - **Reduces Hallucinations**: LLM sees actual document text
-            - **Source Attribution**: Know where answers come from
-            - **Up-to-date Info**: Use your latest documents
-            - **Private Data**: Your documents, your answers
-            """)
+        show_landing_page()
     else:
-        st.success(f"✅ {st.session_state.file_count} documents loaded! Ask questions below.")
+        # Chat interface header
+        if st.session_state.demo_mode:
+            st.success("🎮 **Demo Mode** - Try asking questions about machine learning!")
+            with st.expander("💡 Suggested Questions"):
+                cols = st.columns(2)
+                suggestions = [
+                    "What is supervised learning?",
+                    "What are the applications of deep learning?",
+                    "What are the challenges in machine learning?",
+                    "Explain reinforcement learning"
+                ]
+                for i, suggestion in enumerate(suggestions):
+                    with cols[i % 2]:
+                        st.code(suggestion)
+        else:
+            st.success(f"✅ {st.session_state.file_count} documents loaded! Ask questions below.")
         
         # Display chat history
         for message in st.session_state.chat_history:
@@ -381,13 +652,13 @@ def main():
                     st.write(prompt)
                 
                 # Retrieve relevant chunks
-                with st.spinner("Searching documents..."):
+                with st.spinner("🔍 Searching documents..."):
                     vector_store = VectorStore()
                     vector_store.collection = st.session_state.collection
                     context_chunks, context_metadata = vector_store.query(prompt, n_results=5)
                 
                 # Generate answer
-                with st.spinner("Generating answer..."):
+                with st.spinner("🤖 Generating answer..."):
                     rag_generator = RAGGenerator(api_key)
                     answer = rag_generator.generate_answer(
                         prompt, 
