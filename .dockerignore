@@ -1,0 +1,37 @@
+# Exclude version control
+.git
+.gitignore
+
+# Exclude dependencies and environments
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# Exclude local configuration
+.env
+.env.local
+
+# Exclude IDE settings
+.idea/
+.vscode/
+
+# Exclude test cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Exclude data
+data/
+*.db
+*.sqlite
+
+# Exclude logs
+*.log
+logs/
+
+# Explicitly Include src
+!src/
