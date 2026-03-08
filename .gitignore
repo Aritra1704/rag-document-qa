@@ -6,4 +6,4 @@ __pycache__/
 venv/
 .env
 .env.example
-.DS_Store
+.DS_Store.venv/

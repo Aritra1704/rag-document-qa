@@ -14,6 +14,10 @@ import io
 import os
 import logging
 from typing import List, Tuple, Optional
+from name_finder import (
+    run_name_search,
+    summarize_extraction_debug,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -87,6 +91,10 @@ if 'demo_mode' not in st.session_state:
     st.session_state.demo_mode = False
 if 'show_tutorial' not in st.session_state:
     st.session_state.show_tutorial = True
+if 'name_search_outcome' not in st.session_state:
+    st.session_state.name_search_outcome = None
+if 'name_search_show_debug' not in st.session_state:
+    st.session_state.name_search_show_debug = False
 
 # Demo document content
 DEMO_DOCUMENT = """
@@ -542,36 +550,239 @@ def show_landing_page():
     st.markdown("---")
     st.markdown("### 📤 Or Upload Your Own Documents in the Sidebar")
 
+def show_name_search_workflow():
+    """Render folder-based PDF name verification workflow."""
+
+    st.markdown('<div class="main-header">🔎 PDF Name Search</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sub-header">Recursively scan local PDFs and verify an exact name page-by-page.</div>',
+        unsafe_allow_html=True,
+    )
+
+    folder_path = st.text_input(
+        "Folder Path",
+        value=st.session_state.get("name_search_folder_path", ""),
+        placeholder="/Users/aritra/Documents/pdfs",
+        help="Local folder path to scan recursively for PDF files",
+    )
+    name_input = st.text_input(
+        "Name to Search",
+        value=st.session_state.get("name_search_name", ""),
+        placeholder="John Smith",
+        help="Exact name to search for (case-insensitive)",
+    )
+    st.checkbox(
+        "Show extraction debug details",
+        key="name_search_show_debug",
+        help="Show file/page-level extractor attempts to debug text extraction issues",
+    )
+
+    if st.button("Search PDFs", type="primary"):
+        st.session_state.name_search_folder_path = folder_path
+        st.session_state.name_search_name = name_input
+
+        if not folder_path.strip():
+            st.session_state.name_search_outcome = None
+            st.warning("Please provide a folder path.")
+        elif not name_input.strip():
+            st.session_state.name_search_outcome = None
+            st.warning("Please provide a name to search.")
+        else:
+            resolved_folder = Path(folder_path).expanduser()
+            if not resolved_folder.exists() or not resolved_folder.is_dir():
+                st.session_state.name_search_outcome = None
+                st.error(f"Folder path does not exist or is not a directory: {resolved_folder}")
+            else:
+                try:
+                    with st.spinner("Scanning PDFs and searching for exact matches..."):
+                        outcome = run_name_search(
+                            folder_path=folder_path,
+                            raw_names=name_input,
+                            enable_semantic_fallback=False,
+                        )
+                except ValueError as exc:
+                    st.session_state.name_search_outcome = None
+                    st.error(str(exc))
+                else:
+                    st.session_state.name_search_outcome = outcome
+                    st.success(f"Search complete. PDFs discovered: {len(outcome.pdf_files)}")
+
+    outcome = st.session_state.get("name_search_outcome")
+    if not outcome:
+        st.info("Enter a folder path and a name, then click 'Search PDFs'.")
+        return
+
+    st.subheader("Results")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("PDFs Found", len(outcome.pdf_files))
+    with col2:
+        st.metric("Total Matches Found", len(outcome.results))
+
+    if not outcome.pdf_files:
+        st.warning("No PDF files were discovered in the selected folder.")
+
+    if outcome.skipped_files:
+        with st.expander("Skipped Files / Warnings"):
+            for skipped in outcome.skipped_files:
+                st.write(f"- {skipped}")
+
+    searched_name = outcome.names[0] if outcome.names else name_input.strip()
+    exact_matches = [match for match in outcome.results if match.match_type == "exact"]
+    if not exact_matches:
+        st.info(f'No matches found for "{searched_name}"')
+    else:
+        for match in exact_matches:
+            match_block = (
+                f"Name: {match.searched_name}\n"
+                f"File: {match.file_name}\n"
+                f"Path: {match.file_path}\n"
+                f"Page: {match.page_number}\n"
+                f"Position: {match.match_position}\n"
+                f"Match Type: {match.match_type}\n"
+                f'Snippet: "{match.snippet}"\n'
+                "--------------------------------------------------"
+            )
+            st.code(match_block, language="text")
+
+    if st.session_state.get("name_search_show_debug", False):
+        debug_entries = outcome.extraction_debug
+        st.markdown("### Extraction Debug")
+        if not debug_entries:
+            st.info("No extraction debug data available for this run.")
+            return
+
+        summary = summarize_extraction_debug(debug_entries)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("PDFs Discovered", int(summary["pdfs_discovered"]))
+        col2.metric("PDFs With Text", int(summary["pdfs_with_extracted_text"]))
+        col3.metric("PDFs Fully Skipped", int(summary["pdfs_fully_skipped"]))
+
+        col4, col5, col6 = st.columns(3)
+        col4.metric("Pages Processed", int(summary["total_pages_processed"]))
+        col5.metric("Pages With Text", int(summary["pages_with_text"]))
+        col6.metric("Pages With No Text", int(summary["pages_with_no_text"]))
+
+        extractor_success_counts = summary["extractor_success_counts"]
+        if extractor_success_counts:
+            extractor_counts_text = ", ".join(
+                f"{name}: {count}" for name, count in extractor_success_counts.items()
+            )
+            st.caption(f"Extractor success counts: {extractor_counts_text}")
+        else:
+            st.caption("Extractor success counts: none")
+
+        max_debug_files = 10
+        max_debug_pages_per_file = 50
+        st.caption(
+            "Detailed page diagnostics are capped to keep this page responsive. "
+            f"Showing up to {max_debug_files} files and {max_debug_pages_per_file} pages per file. "
+            "Summary metrics above are computed across all scanned files/pages."
+        )
+
+        displayed_files = debug_entries[:max_debug_files]
+        if len(debug_entries) > max_debug_files:
+            st.caption(f"Showing detailed diagnostics for first {max_debug_files} of {len(debug_entries)} files.")
+
+        for file_debug in displayed_files:
+            file_status = "skipped" if file_debug.skipped else "extracted"
+            with st.expander(f"{file_debug.file_name} ({file_status})"):
+                st.text(f"Path: {file_debug.file_path}")
+                total_pages = len(file_debug.page_debug)
+                successful_pages = sum(1 for page in file_debug.page_debug if not page.skipped)
+                failed_pages = total_pages - successful_pages
+                st.write(
+                    f"Pages processed: {total_pages} | Successful pages: {successful_pages} | "
+                    f"Failed pages: {failed_pages}"
+                )
+                if file_debug.skip_reason:
+                    st.warning(f"File status reason: {file_debug.skip_reason}")
+                if file_debug.open_errors:
+                    st.write("Extractor open errors:")
+                    for extractor_name, error_message in file_debug.open_errors.items():
+                        st.write(f"- {extractor_name}: {error_message}")
+
+                if not file_debug.page_debug:
+                    st.caption("No page-level diagnostics available for this file.")
+                    continue
+
+                page_rows = []
+                for page_debug in file_debug.page_debug[:max_debug_pages_per_file]:
+                    page_status = "skipped" if page_debug.skipped else "extracted"
+                    attempted_order = " -> ".join(page_debug.attempted_extractors)
+                    successful_extractor = page_debug.successful_extractor or "none"
+                    whitespace_only = "yes" if page_debug.whitespace_only else "no"
+
+                    attempt_summaries = []
+                    attempt_errors = []
+                    for attempt in page_debug.attempts:
+                        attempt_status = "success" if attempt.succeeded else "failed"
+                        attempt_whitespace = "yes" if attempt.whitespace_only else "no"
+                        attempt_summaries.append(
+                            f"{attempt.extractor_name}:{attempt_status}"
+                            f"(chars={attempt.character_count}, whitespace={attempt_whitespace})"
+                        )
+                        if attempt.error:
+                            attempt_errors.append(f"{attempt.extractor_name}: {attempt.error}")
+
+                    page_rows.append(
+                        {
+                            "File Path": page_debug.file_path,
+                            "Page": page_debug.page_number,
+                            "Attempted Extractors": attempted_order,
+                            "Successful Extractor": successful_extractor,
+                            "Characters": page_debug.character_count,
+                            "Whitespace Only": whitespace_only,
+                            "Status": page_status,
+                            "Preview": page_debug.preview,
+                            "Attempt Details": " | ".join(attempt_summaries),
+                            "Errors": " | ".join(attempt_errors),
+                        }
+                    )
+
+                st.dataframe(page_rows, use_container_width=True, hide_index=True)
+                if len(file_debug.page_debug) > max_debug_pages_per_file:
+                    st.caption(
+                        f"Showing first {max_debug_pages_per_file} of {len(file_debug.page_debug)} pages for this file."
+                    )
+
+
 def main():
-    """Main application function"""
-    
-    # Sidebar configuration
+    """Main application function."""
+
+    workflow_mode = st.sidebar.radio(
+        "Workflow",
+        ["Document Q&A", "PDF Name Search"],
+        index=0,
+    )
+
+    if workflow_mode == "PDF Name Search":
+        show_name_search_workflow()
+        return
+
     with st.sidebar:
         st.header("⚙️ Configuration")
-        
-        # API Key input
+
         api_key = st.text_input(
             "Anthropic API Key",
             type="password",
             help="Get your API key from https://console.anthropic.com/",
             value=os.environ.get("ANTHROPIC_API_KEY", "")
         )
-        
+
         st.divider()
-        
-        # Mode Selection
+
         if not st.session_state.documents_processed:
             st.header("🚀 Get Started")
-            
+
             if st.button("🎮 Try Demo Mode", type="secondary", use_container_width=True):
                 with st.spinner("Loading demo..."):
                     if load_demo_mode():
                         st.success("✅ Demo loaded!")
                         st.rerun()
-            
+
             st.markdown("**OR**")
-        
-        # Document upload
+
         st.header("📄 Upload Your Documents")
         uploaded_files = st.file_uploader(
             "Choose files",
@@ -579,8 +790,7 @@ def main():
             type=['pdf', 'docx', 'txt'],
             help="Upload PDF, Word, or text files"
         )
-        
-        # Process button
+
         if st.button("Process Documents", type="primary", disabled=not uploaded_files):
             if not api_key:
                 st.error("Please enter your Anthropic API key first!")
@@ -588,17 +798,16 @@ def main():
                 with st.spinner("Processing documents..."):
                     process_documents(uploaded_files, api_key)
                     st.rerun()
-        
-        # Stats
+
         if st.session_state.documents_processed:
             st.divider()
-            
+
             if st.session_state.demo_mode:
                 st.info("📌 Demo Mode Active")
-            
+
             st.metric("Files Loaded", st.session_state.file_count)
             st.metric("Text Chunks", st.session_state.chunk_count)
-            
+
             if st.button("🔄 Reset", type="secondary"):
                 st.session_state.documents_processed = False
                 st.session_state.collection = None
@@ -607,12 +816,10 @@ def main():
                 st.session_state.file_count = 0
                 st.session_state.demo_mode = False
                 st.rerun()
-    
-    # Main content area
+
     if not st.session_state.documents_processed:
         show_landing_page()
     else:
-        # Chat interface header
         if st.session_state.demo_mode:
             st.success("🎮 **Demo Mode** - Try asking questions about machine learning!")
             with st.expander("💡 Suggested Questions"):
@@ -628,8 +835,7 @@ def main():
                         st.code(suggestion)
         else:
             st.success(f"✅ {st.session_state.file_count} documents loaded! Ask questions below.")
-        
-        # Display chat history
+
         for message in st.session_state.chat_history:
             with st.chat_message(message["role"]):
                 st.write(message["content"])
@@ -640,46 +846,42 @@ def main():
                             st.text(chunk[:300] + "..." if len(chunk) > 300 else chunk)
                             if i < len(message["sources"]):
                                 st.divider()
-        
-        # Chat input
+
         if prompt := st.chat_input("Ask a question about your documents..."):
             if not api_key:
                 st.error("Please enter your Anthropic API key in the sidebar!")
             else:
-                # Add user message
                 st.session_state.chat_history.append({"role": "user", "content": prompt})
                 with st.chat_message("user"):
                     st.write(prompt)
-                
-                # Retrieve relevant chunks
+
                 with st.spinner("🔍 Searching documents..."):
                     vector_store = VectorStore()
                     vector_store.collection = st.session_state.collection
                     context_chunks, context_metadata = vector_store.query(prompt, n_results=5)
-                
-                # Generate answer
+
                 with st.spinner("🤖 Generating answer..."):
                     rag_generator = RAGGenerator(api_key)
                     answer = rag_generator.generate_answer(
-                        prompt, 
-                        context_chunks, 
+                        prompt,
+                        context_chunks,
                         context_metadata
                     )
-                
-                # Add assistant message
+
                 st.session_state.chat_history.append({
                     "role": "assistant",
                     "content": answer,
                     "sources": list(zip(context_chunks, context_metadata))
                 })
-                
+
                 with st.chat_message("assistant"):
                     st.write(answer)
                     with st.expander("📚 View Sources"):
-                        for i, (chunk, meta) in enumerate(zip(context_chunks, context_metadata), 1):
+                        sources = list(zip(context_chunks, context_metadata))
+                        for i, (chunk, meta) in enumerate(sources, 1):
                             st.markdown(f"**Chunk {i}** (from {meta['source']})")
                             st.text(chunk[:300] + "..." if len(chunk) > 300 else chunk)
-                            if i < len(zip(context_chunks, context_metadata)):
+                            if i < len(sources):
                                 st.divider()
 
 if __name__ == "__main__":
