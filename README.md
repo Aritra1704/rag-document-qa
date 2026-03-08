@@ -1,9 +1,10 @@
 # rag-document-qa
 
-Streamlit app with two local workflows:
+Streamlit app with three local workflows:
 
 1. `Document Q&A` (existing RAG chat flow)
 2. `PDF Name Search` (new folder-based name verification utility)
+3. `Local Ollama RAG` (local semantic retrieval and QA)
 
 The Q&A flow is preserved. The name-search flow is additive and optimized for exact name verification in local PDFs.
 
@@ -37,6 +38,27 @@ export ANTHROPIC_API_KEY="your_key_here"
 ```bash
 streamlit run src/app.py
 ```
+
+## Local Ollama Setup (for Local Ollama RAG workflow)
+
+1. Start Ollama locally (macOS):
+
+```bash
+ollama serve
+```
+
+2. Pull required local models:
+
+```bash
+ollama pull nomic-embed-text:latest
+ollama pull qwen2.5:7b-instruct
+```
+
+3. In the app, choose `Workflow -> Local Ollama RAG` and keep defaults unless needed:
+
+- `Ollama Base URL`: `http://localhost:11434`
+- `Embedding Model`: `nomic-embed-text:latest`
+- `Chat Model`: `qwen2.5:7b-instruct`
 
 ## Workflows
 
@@ -72,6 +94,8 @@ Optional diagnostics:
 
 - Enable `Show extraction debug details` to inspect per-file/per-page extractor attempts
 - Includes attempted extractor order, successful extractor, char counts, whitespace-only status, preview text, and errors
+- Includes environment diagnostics (`sys.executable`, `sys.version`, extractor importability, and `pdftotext` command availability)
+- Includes a quick one-file diagnostic action (first 3 pages) for fast troubleshooting
 - Detailed page-level diagnostics are capped in the UI for responsiveness, while summary metrics still cover all scanned files/pages
 
 ## Exact Search Behavior (Primary)
@@ -81,9 +105,25 @@ Optional diagnostics:
 - Names safely escaped for regex
 - Phase 1 UI input is a single name per search
 - Page-by-page matching
+- Text extraction fallback order: `PyPDF2 -> pypdf -> pdfplumber -> PyMuPDF(fitz) -> pdftotext` (when available)
 - Match position/index is captured from page text
 - Snippet extraction around each match (not full page dump)
 - Multiple matches on same page are returned, with duplicate suppression
+
+### 3) Local Ollama RAG (new behavior)
+
+- Upload PDFs/DOCX/TXT for local embedding and retrieval
+- Uses local Ollama embeddings + chat model for semantic QA
+- Connectivity diagnostics in UI:
+  - endpoint reachability
+  - embedding/chat model availability
+- Answers are generated from retrieved context with source references
+
+## Deterministic vs LLM-Assisted
+
+- `PDF Name Search` exact matching is deterministic and remains the source of truth for verification.
+- `Local Ollama RAG` is LLM-assisted and intended for semantic retrieval, summarization, and question answering.
+- Verification should rely on exact-match results, not model guesses.
 
 ## Future Enhancements (Post-Phase 1)
 
@@ -113,6 +153,7 @@ Then prints grouped matches and saves `results.csv`.
 
 Key files for this feature:
 
-- `src/app.py` (added PDF Name Search workflow mode in Streamlit)
+- `src/app.py` (workflow switch, PDF Name Search UI, Local Ollama RAG UI)
+- `src/ollama_rag.py` (local Ollama diagnostics, embeddings, and chat helpers)
 - `src/name_finder.py` (folder scan, PDF page extraction, exact/semantic search, CSV export, CLI)
-- `tests/test_name_finder.py` (new tests for name-search utilities)
+- `tests/test_name_finder.py` (tests for name-search utilities and extraction debug behavior)

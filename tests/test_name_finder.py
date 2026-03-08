@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import name_finder  # noqa: E402
 from name_finder import (  # noqa: E402
+    ExtractorOpenDebug,
     NameMatch,
     PageRecord,
     collect_pdf_pages,
@@ -58,7 +59,20 @@ def test_collect_pdf_pages_uses_fallback_extractor(monkeypatch, tmp_path):
         close=lambda: None,
     )
 
-    monkeypatch.setattr(name_finder, "_build_pdf_extractors", lambda _: ([primary, fallback], {}))
+    monkeypatch.setattr(
+        name_finder,
+        "_build_pdf_extractors",
+        lambda _: (
+            {"PyPDF2": primary, "pypdf": fallback},
+            {
+                "PyPDF2": ExtractorOpenDebug("PyPDF2", True, True, True, None),
+                "pypdf": ExtractorOpenDebug("pypdf", True, True, True, None),
+                "pdfplumber": ExtractorOpenDebug("pdfplumber", False, False, False, "import failed"),
+                "pymupdf": ExtractorOpenDebug("pymupdf", False, False, False, "import failed"),
+                "pdftotext": ExtractorOpenDebug("pdftotext", False, False, False, "command not found"),
+            },
+        ),
+    )
 
     pages, skipped = collect_pdf_pages([pdf_path])
     assert len(pages) == 1
@@ -93,12 +107,25 @@ def test_collect_pdf_pages_marks_file_only_after_all_extractors_fail(monkeypatch
         ),
     ]
 
-    monkeypatch.setattr(name_finder, "_build_pdf_extractors", lambda _: (extractors, {}))
+    monkeypatch.setattr(
+        name_finder,
+        "_build_pdf_extractors",
+        lambda _: (
+            {extractor.name: extractor for extractor in extractors},
+            {
+                "PyPDF2": ExtractorOpenDebug("PyPDF2", True, True, True, None),
+                "pypdf": ExtractorOpenDebug("pypdf", True, True, True, None),
+                "pdfplumber": ExtractorOpenDebug("pdfplumber", True, True, True, None),
+                "pymupdf": ExtractorOpenDebug("pymupdf", False, False, False, "import failed"),
+                "pdftotext": ExtractorOpenDebug("pdftotext", False, False, False, "command not found"),
+            },
+        ),
+    )
 
     pages, skipped = collect_pdf_pages([pdf_path])
     assert pages == []
     assert len(skipped) == 1
-    assert "no extractable text after PyPDF2, pypdf, and pdfplumber" in skipped[0]
+    assert "no extractable text after PyPDF2, pypdf, pdfplumber, pymupdf, and pdftotext" in skipped[0]
 
 
 def test_collect_pdf_pages_debug_and_summary(monkeypatch, tmp_path):
@@ -112,13 +139,34 @@ def test_collect_pdf_pages_debug_and_summary(monkeypatch, tmp_path):
         close=lambda: None,
     )
 
-    monkeypatch.setattr(name_finder, "_build_pdf_extractors", lambda _: ([primary], {"pypdf": "not available"}))
+    monkeypatch.setattr(
+        name_finder,
+        "_build_pdf_extractors",
+        lambda _: (
+            {"PyPDF2": primary},
+            {
+                "PyPDF2": ExtractorOpenDebug("PyPDF2", True, True, True, None),
+                "pypdf": ExtractorOpenDebug("pypdf", False, False, False, "import failed"),
+                "pdfplumber": ExtractorOpenDebug("pdfplumber", False, False, False, "import failed"),
+                "pymupdf": ExtractorOpenDebug("pymupdf", False, False, False, "import failed"),
+                "pdftotext": ExtractorOpenDebug("pdftotext", False, False, False, "command not found"),
+            },
+        ),
+    )
 
     pages, skipped, debug_entries = collect_pdf_pages([pdf_path], include_debug=True)
     assert len(pages) == 1
     assert skipped == []
     assert len(debug_entries) == 1
     assert len(debug_entries[0].page_debug) == 2
+    assert debug_entries[0].extractor_open_debug[0].extractor_name == "PyPDF2"
+    first_page_attempts = debug_entries[0].page_debug[0].attempts
+    assert len(first_page_attempts) == 5
+    assert first_page_attempts[0].extractor_name == "PyPDF2"
+    assert first_page_attempts[0].extraction_attempted is True
+    assert first_page_attempts[0].succeeded is True
+    assert first_page_attempts[1].extraction_attempted is False
+    assert "skipped after winner" in (first_page_attempts[1].error or "")
 
     summary = summarize_extraction_debug(debug_entries)
     assert summary["pdfs_discovered"] == 1

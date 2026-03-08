@@ -6,6 +6,9 @@ Enhanced with Demo Mode and Interactive UI
 import streamlit as st
 import anthropic
 from pathlib import Path
+import importlib.util
+import shutil
+import sys
 import chromadb
 from chromadb.utils import embedding_functions
 import PyPDF2
@@ -15,8 +18,14 @@ import os
 import logging
 from typing import List, Tuple, Optional
 from name_finder import (
+    collect_pdf_pages,
     run_name_search,
     summarize_extraction_debug,
+)
+from ollama_rag import (
+    create_ollama_collection,
+    generate_ollama_answer,
+    get_ollama_diagnostics,
 )
 
 # Configure logging
@@ -95,6 +104,28 @@ if 'name_search_outcome' not in st.session_state:
     st.session_state.name_search_outcome = None
 if 'name_search_show_debug' not in st.session_state:
     st.session_state.name_search_show_debug = False
+if 'name_search_quick_debug' not in st.session_state:
+    st.session_state.name_search_quick_debug = None
+if 'ollama_collection' not in st.session_state:
+    st.session_state.ollama_collection = None
+if 'ollama_documents_processed' not in st.session_state:
+    st.session_state.ollama_documents_processed = False
+if 'ollama_chat_history' not in st.session_state:
+    st.session_state.ollama_chat_history = []
+if 'ollama_chunk_count' not in st.session_state:
+    st.session_state.ollama_chunk_count = 0
+if 'ollama_file_count' not in st.session_state:
+    st.session_state.ollama_file_count = 0
+if 'ollama_ingestion_warnings' not in st.session_state:
+    st.session_state.ollama_ingestion_warnings = []
+if 'ollama_diagnostics' not in st.session_state:
+    st.session_state.ollama_diagnostics = None
+if 'ollama_base_url' not in st.session_state:
+    st.session_state.ollama_base_url = "http://localhost:11434"
+if 'ollama_embedding_model' not in st.session_state:
+    st.session_state.ollama_embedding_model = "nomic-embed-text:latest"
+if 'ollama_chat_model' not in st.session_state:
+    st.session_state.ollama_chat_model = "qwen2.5:7b-instruct"
 
 # Demo document content
 DEMO_DOCUMENT = """
@@ -652,6 +683,21 @@ def show_name_search_workflow():
             st.info("No extraction debug data available for this run.")
             return
 
+        def yes_no(value: bool) -> str:
+            return "yes" if value else "no"
+
+        st.markdown("#### Environment Diagnostics")
+        env_rows = [
+            {"Metric": "sys.executable", "Value": sys.executable},
+            {"Metric": "sys.version", "Value": sys.version.replace("\n", " ")},
+            {"Metric": "PyPDF2 importable", "Value": yes_no(importlib.util.find_spec("PyPDF2") is not None)},
+            {"Metric": "pypdf importable", "Value": yes_no(importlib.util.find_spec("pypdf") is not None)},
+            {"Metric": "pdfplumber importable", "Value": yes_no(importlib.util.find_spec("pdfplumber") is not None)},
+            {"Metric": "PyMuPDF (fitz) importable", "Value": yes_no(importlib.util.find_spec("fitz") is not None)},
+            {"Metric": "pdftotext command available", "Value": yes_no(shutil.which("pdftotext") is not None)},
+        ]
+        st.dataframe(env_rows, use_container_width=True, hide_index=True)
+
         summary = summarize_extraction_debug(debug_entries)
         col1, col2, col3 = st.columns(3)
         col1.metric("PDFs Discovered", int(summary["pdfs_discovered"]))
@@ -671,6 +717,65 @@ def show_name_search_workflow():
             st.caption(f"Extractor success counts: {extractor_counts_text}")
         else:
             st.caption("Extractor success counts: none")
+
+        st.markdown("#### Quick One-File Diagnostic (First 3 Pages)")
+        if outcome.pdf_files:
+            quick_pdf_path = st.selectbox(
+                "Choose a scanned PDF for quick diagnostics",
+                options=outcome.pdf_files,
+                key="name_search_quick_pdf",
+            )
+            if st.button("Run quick diagnostic for selected file", key="run_quick_pdf_diagnostic"):
+                quick_pages, quick_skipped, quick_debug_entries = collect_pdf_pages(
+                    [Path(quick_pdf_path)],
+                    include_debug=True,
+                    max_pages_per_file=3,
+                )
+                st.session_state.name_search_quick_debug = {
+                    "pdf_path": quick_pdf_path,
+                    "pages_extracted": len(quick_pages),
+                    "skipped_messages": quick_skipped,
+                    "debug_entries": quick_debug_entries,
+                }
+
+            quick_debug_payload = st.session_state.get("name_search_quick_debug")
+            if quick_debug_payload and quick_debug_payload.get("pdf_path"):
+                st.caption(
+                    f"Quick diagnostic file: {quick_debug_payload['pdf_path']} "
+                    f"(pages extracted: {quick_debug_payload.get('pages_extracted', 0)})"
+                )
+                if quick_debug_payload.get("skipped_messages"):
+                    st.write("Quick diagnostic warnings:")
+                    for warning in quick_debug_payload["skipped_messages"]:
+                        st.write(f"- {warning}")
+
+                quick_rows = []
+                for quick_file_debug in quick_debug_payload.get("debug_entries", []):
+                    for page_debug in quick_file_debug.page_debug:
+                        winning = page_debug.successful_extractor or "none"
+                        for attempt in page_debug.attempts:
+                            quick_rows.append(
+                                {
+                                    "File Path": page_debug.file_path,
+                                    "Page": page_debug.page_number,
+                                    "Extractor": attempt.extractor_name,
+                                    "Import Available": yes_no(attempt.import_available),
+                                    "Open Attempted": yes_no(attempt.open_attempted),
+                                    "Extraction Attempted": yes_no(attempt.extraction_attempted),
+                                    "Success": yes_no(attempt.succeeded),
+                                    "Characters": attempt.character_count,
+                                    "Whitespace Only": yes_no(attempt.whitespace_only),
+                                    "Preview": attempt.preview[:100],
+                                    "Error": attempt.error or "",
+                                    "Winning Extractor": winning,
+                                }
+                            )
+                if quick_rows:
+                    st.dataframe(quick_rows, use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No quick page-level attempts available.")
+        else:
+            st.caption("No PDFs were discovered, so quick diagnostics are unavailable.")
 
         max_debug_files = 10
         max_debug_pages_per_file = 50
@@ -697,10 +802,20 @@ def show_name_search_workflow():
                 )
                 if file_debug.skip_reason:
                     st.warning(f"File status reason: {file_debug.skip_reason}")
-                if file_debug.open_errors:
-                    st.write("Extractor open errors:")
-                    for extractor_name, error_message in file_debug.open_errors.items():
-                        st.write(f"- {extractor_name}: {error_message}")
+                if file_debug.extractor_open_debug:
+                    st.write("Extractor open status:")
+                    open_rows = []
+                    for open_debug in file_debug.extractor_open_debug:
+                        open_rows.append(
+                            {
+                                "Extractor": open_debug.extractor_name,
+                                "Import Available": yes_no(open_debug.import_available),
+                                "Open Attempted": yes_no(open_debug.open_attempted),
+                                "Open Succeeded": yes_no(open_debug.open_succeeded),
+                                "Error": open_debug.error or "",
+                            }
+                        )
+                    st.dataframe(open_rows, use_container_width=True, hide_index=True)
 
                 if not file_debug.page_debug:
                     st.caption("No page-level diagnostics available for this file.")
@@ -708,37 +823,25 @@ def show_name_search_workflow():
 
                 page_rows = []
                 for page_debug in file_debug.page_debug[:max_debug_pages_per_file]:
-                    page_status = "skipped" if page_debug.skipped else "extracted"
-                    attempted_order = " -> ".join(page_debug.attempted_extractors)
                     successful_extractor = page_debug.successful_extractor or "none"
-                    whitespace_only = "yes" if page_debug.whitespace_only else "no"
-
-                    attempt_summaries = []
-                    attempt_errors = []
                     for attempt in page_debug.attempts:
-                        attempt_status = "success" if attempt.succeeded else "failed"
-                        attempt_whitespace = "yes" if attempt.whitespace_only else "no"
-                        attempt_summaries.append(
-                            f"{attempt.extractor_name}:{attempt_status}"
-                            f"(chars={attempt.character_count}, whitespace={attempt_whitespace})"
+                        page_rows.append(
+                            {
+                                "File Path": page_debug.file_path,
+                                "Page": page_debug.page_number,
+                                "Extractor": attempt.extractor_name,
+                                "Import Available": yes_no(attempt.import_available),
+                                "Open Attempted": yes_no(attempt.open_attempted),
+                                "Extraction Attempted": yes_no(attempt.extraction_attempted),
+                                "Success": yes_no(attempt.succeeded),
+                                "Characters": attempt.character_count,
+                                "Whitespace Only": yes_no(attempt.whitespace_only),
+                                "Preview": attempt.preview[:100],
+                                "Error": attempt.error or "",
+                                "Winning Extractor": successful_extractor,
+                                "Page Status": "skipped" if page_debug.skipped else "extracted",
+                            }
                         )
-                        if attempt.error:
-                            attempt_errors.append(f"{attempt.extractor_name}: {attempt.error}")
-
-                    page_rows.append(
-                        {
-                            "File Path": page_debug.file_path,
-                            "Page": page_debug.page_number,
-                            "Attempted Extractors": attempted_order,
-                            "Successful Extractor": successful_extractor,
-                            "Characters": page_debug.character_count,
-                            "Whitespace Only": whitespace_only,
-                            "Status": page_status,
-                            "Preview": page_debug.preview,
-                            "Attempt Details": " | ".join(attempt_summaries),
-                            "Errors": " | ".join(attempt_errors),
-                        }
-                    )
 
                 st.dataframe(page_rows, use_container_width=True, hide_index=True)
                 if len(file_debug.page_debug) > max_debug_pages_per_file:
@@ -747,17 +850,273 @@ def show_name_search_workflow():
                     )
 
 
+def _extract_chunks_for_ollama(uploaded_files) -> Tuple[List[str], List[dict], List[str], List[str]]:
+    """Extract chunked documents and metadata for local Ollama RAG ingestion."""
+
+    doc_processor = DocumentProcessor()
+    chunks: List[str] = []
+    metadatas: List[dict] = []
+    ids: List[str] = []
+    warnings: List[str] = []
+    chunk_id = 0
+
+    for file in uploaded_files:
+        file_bytes = file.getvalue()
+        file_name_lower = file.name.lower()
+
+        if file_name_lower.endswith(".pdf"):
+            try:
+                reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"{file.name}: failed to open PDF ({exc})")
+                continue
+
+            if getattr(reader, "is_encrypted", False):
+                try:
+                    unlocked = reader.decrypt("")
+                except Exception:  # noqa: BLE001
+                    unlocked = 0
+                if unlocked == 0:
+                    warnings.append(f"{file.name}: password-protected PDF (skipped)")
+                    continue
+
+            file_has_text = False
+            for page_number, page in enumerate(reader.pages, start=1):
+                try:
+                    page_text = page.extract_text() or ""
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"{file.name} page {page_number}: extraction error ({exc})")
+                    page_text = ""
+
+                page_chunks = doc_processor.chunk_text(page_text)
+                for chunk in page_chunks:
+                    if not chunk.strip():
+                        continue
+                    file_has_text = True
+                    chunks.append(chunk)
+                    metadatas.append({"source": file.name, "page": page_number})
+                    ids.append(f"ollama_chunk_{chunk_id}")
+                    chunk_id += 1
+
+            if not file_has_text:
+                warnings.append(f"{file.name}: no extractable text")
+            continue
+
+        if file_name_lower.endswith(".docx"):
+            try:
+                text = doc_processor.extract_text_from_docx(io.BytesIO(file_bytes))
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"{file.name}: DOCX extraction error ({exc})")
+                continue
+        elif file_name_lower.endswith(".txt"):
+            try:
+                text = file_bytes.decode("utf-8")
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"{file.name}: TXT decode error ({exc})")
+                continue
+        else:
+            warnings.append(f"{file.name}: unsupported file type")
+            continue
+
+        text_chunks = doc_processor.chunk_text(text)
+        if not text_chunks:
+            warnings.append(f"{file.name}: no extractable text")
+            continue
+
+        for chunk in text_chunks:
+            if not chunk.strip():
+                continue
+            chunks.append(chunk)
+            metadatas.append({"source": file.name, "page": "N/A"})
+            ids.append(f"ollama_chunk_{chunk_id}")
+            chunk_id += 1
+
+    return chunks, metadatas, ids, warnings
+
+
+def _render_source_label(metadata: dict) -> str:
+    source = str(metadata.get("source", "unknown"))
+    page = metadata.get("page")
+    if page in (None, "", "N/A", 0):
+        return source
+    return f"{source} (page {page})"
+
+
+def show_ollama_rag_workflow():
+    """Render local Ollama-backed RAG workflow."""
+
+    st.markdown('<div class="main-header">🧠 Local Ollama RAG</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="sub-header">Local semantic retrieval and Q&A. Exact name verification remains deterministic in PDF Name Search.</div>',
+        unsafe_allow_html=True,
+    )
+
+    base_url = st.text_input(
+        "Ollama Base URL",
+        value=st.session_state.get("ollama_base_url", "http://localhost:11434"),
+        help="Local Ollama endpoint",
+    )
+    embedding_model = st.text_input(
+        "Embedding Model",
+        value=st.session_state.get("ollama_embedding_model", "nomic-embed-text:latest"),
+        help="Model used for local embeddings",
+    )
+    chat_model = st.text_input(
+        "Chat Model",
+        value=st.session_state.get("ollama_chat_model", "qwen2.5:7b-instruct"),
+        help="Model used for local answers",
+    )
+
+    st.session_state.ollama_base_url = base_url
+    st.session_state.ollama_embedding_model = embedding_model
+    st.session_state.ollama_chat_model = chat_model
+
+    if st.button("Check Ollama Connectivity", key="check_ollama_connectivity"):
+        st.session_state.ollama_diagnostics = get_ollama_diagnostics(
+            base_url=base_url,
+            embedding_model=embedding_model,
+            chat_model=chat_model,
+        )
+
+    diagnostics = st.session_state.get("ollama_diagnostics")
+    if diagnostics:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Endpoint Reachable", "Yes" if diagnostics["endpoint_reachable"] else "No")
+        col2.metric("Embedding Model Available", "Yes" if diagnostics["embedding_model_available"] else "No")
+        col3.metric("Chat Model Available", "Yes" if diagnostics["chat_model_available"] else "No")
+        if diagnostics.get("endpoint_error"):
+            st.warning(f"Ollama diagnostics error: {diagnostics['endpoint_error']}")
+        model_names = diagnostics.get("model_names", [])
+        if model_names:
+            st.caption("Available local models: " + ", ".join(model_names))
+
+    uploaded_files = st.file_uploader(
+        "Upload files for local RAG (PDF, DOCX, TXT)",
+        accept_multiple_files=True,
+        type=["pdf", "docx", "txt"],
+        key="ollama_file_uploader",
+    )
+
+    if st.button("Process Documents for Local Ollama RAG", type="primary", disabled=not uploaded_files):
+        try:
+            with st.spinner("Processing documents and building local embeddings..."):
+                chunks, metadatas, ids, warnings = _extract_chunks_for_ollama(uploaded_files)
+                if not chunks:
+                    raise ValueError("No extractable text found in uploaded documents.")
+
+                collection = create_ollama_collection(
+                    base_url=base_url,
+                    embedding_model=embedding_model,
+                    collection_name="ollama_documents",
+                )
+                collection.add(documents=chunks, metadatas=metadatas, ids=ids)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Local Ollama RAG setup failed: {exc}")
+            st.session_state.ollama_documents_processed = False
+            st.session_state.ollama_collection = None
+            st.session_state.ollama_chat_history = []
+            st.session_state.ollama_chunk_count = 0
+            st.session_state.ollama_file_count = 0
+            st.session_state.ollama_ingestion_warnings = []
+        else:
+            st.session_state.ollama_collection = collection
+            st.session_state.ollama_documents_processed = True
+            st.session_state.ollama_chat_history = []
+            st.session_state.ollama_chunk_count = len(chunks)
+            st.session_state.ollama_file_count = len(uploaded_files)
+            st.session_state.ollama_ingestion_warnings = warnings
+            st.success(
+                f"Processed {len(uploaded_files)} files into {len(chunks)} chunks using local Ollama embeddings."
+            )
+
+    if not st.session_state.ollama_documents_processed:
+        st.info("Upload files, check Ollama connectivity, then process documents to start local RAG Q&A.")
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Files Loaded", st.session_state.ollama_file_count)
+    with col2:
+        st.metric("Text Chunks", st.session_state.ollama_chunk_count)
+
+    if st.session_state.ollama_ingestion_warnings:
+        with st.expander("Ingestion Warnings"):
+            for warning in st.session_state.ollama_ingestion_warnings:
+                st.write(f"- {warning}")
+
+    if st.button("Reset Local Ollama RAG", key="reset_ollama_rag"):
+        st.session_state.ollama_documents_processed = False
+        st.session_state.ollama_collection = None
+        st.session_state.ollama_chat_history = []
+        st.session_state.ollama_chunk_count = 0
+        st.session_state.ollama_file_count = 0
+        st.session_state.ollama_ingestion_warnings = []
+        st.rerun()
+
+    for message in st.session_state.ollama_chat_history:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+            sources = message.get("sources")
+            if sources:
+                with st.expander("Sources"):
+                    for source in sources:
+                        st.write(f"- {source}")
+
+    if query := st.chat_input("Ask a question about your documents (Local Ollama RAG)..."):
+        st.session_state.ollama_chat_history.append({"role": "user", "content": query})
+        with st.chat_message("user"):
+            st.write(query)
+
+        collection = st.session_state.ollama_collection
+        try:
+            with st.spinner("Retrieving relevant chunks..."):
+                query_result = collection.query(query_texts=[query], n_results=5)
+                context_chunks = query_result.get("documents", [[]])[0]
+                context_metadata = query_result.get("metadatas", [[]])[0]
+
+            with st.spinner("Generating local Ollama answer..."):
+                answer = generate_ollama_answer(
+                    base_url=base_url,
+                    chat_model=chat_model,
+                    query=query,
+                    context_chunks=context_chunks,
+                    context_metadata=context_metadata,
+                )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Local Ollama RAG query failed: {exc}")
+            return
+
+        source_labels = [_render_source_label(metadata) for metadata in context_metadata]
+        st.session_state.ollama_chat_history.append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "sources": source_labels,
+            }
+        )
+
+        with st.chat_message("assistant"):
+            st.write(answer)
+            with st.expander("Sources"):
+                for source_label in source_labels:
+                    st.write(f"- {source_label}")
+
+
 def main():
     """Main application function."""
 
     workflow_mode = st.sidebar.radio(
         "Workflow",
-        ["Document Q&A", "PDF Name Search"],
+        ["Document Q&A", "PDF Name Search", "Local Ollama RAG"],
         index=0,
     )
 
     if workflow_mode == "PDF Name Search":
         show_name_search_workflow()
+        return
+
+    if workflow_mode == "Local Ollama RAG":
+        show_ollama_rag_workflow()
         return
 
     with st.sidebar:

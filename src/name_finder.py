@@ -5,6 +5,8 @@ from __future__ import annotations
 import csv
 import os
 import re
+import shutil
+import subprocess
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -22,6 +24,8 @@ CSV_COLUMNS = [
     "snippet",
     "match_type",
 ]
+
+EXTRACTOR_ORDER = ["PyPDF2", "pypdf", "pdfplumber", "pymupdf", "pdftotext"]
 
 
 @dataclass(frozen=True)
@@ -67,8 +71,20 @@ class _PdfExtractor:
 
 
 @dataclass(frozen=True)
+class ExtractorOpenDebug:
+    extractor_name: str
+    import_available: bool
+    open_attempted: bool
+    open_succeeded: bool
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class ExtractorAttemptDebug:
     extractor_name: str
+    import_available: bool
+    open_attempted: bool
+    extraction_attempted: bool
     succeeded: bool
     character_count: int
     whitespace_only: bool
@@ -94,7 +110,7 @@ class FileExtractionDebug:
     file_name: str
     file_path: str
     page_debug: List[PageExtractionDebug]
-    open_errors: dict[str, str]
+    extractor_open_debug: List[ExtractorOpenDebug]
     skipped: bool
     skip_reason: str | None
 
@@ -150,11 +166,17 @@ def _preview_text(text: str, max_chars: int = 160) -> str:
     return normalized[:max_chars].rstrip() + " ..."
 
 
-def _open_pypdf2_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, str | None]:
+def _open_pypdf2_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, ExtractorOpenDebug]:
     try:
         reader = PyPDF2.PdfReader(str(pdf_path))
     except Exception as exc:  # noqa: BLE001
-        return None, f"PyPDF2 open failed: {exc}"
+        return None, ExtractorOpenDebug(
+            extractor_name="PyPDF2",
+            import_available=True,
+            open_attempted=True,
+            open_succeeded=False,
+            error=f"open failed: {exc}",
+        )
 
     if getattr(reader, "is_encrypted", False):
         try:
@@ -162,7 +184,13 @@ def _open_pypdf2_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, str | 
         except Exception:  # noqa: BLE001
             unlocked = 0
         if unlocked == 0:
-            return None, "PyPDF2 password-protected"
+            return None, ExtractorOpenDebug(
+                extractor_name="PyPDF2",
+                import_available=True,
+                open_attempted=True,
+                open_succeeded=False,
+                error="password-protected",
+            )
 
     def extract_page_text(page_index: int) -> Tuple[str, str | None]:
         try:
@@ -177,20 +205,38 @@ def _open_pypdf2_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, str | 
             extract_page_text=extract_page_text,
             close=lambda: None,
         ),
-        None,
+        ExtractorOpenDebug(
+            extractor_name="PyPDF2",
+            import_available=True,
+            open_attempted=True,
+            open_succeeded=True,
+            error=None,
+        ),
     )
 
 
-def _open_pypdf_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, str | None]:
+def _open_pypdf_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, ExtractorOpenDebug]:
     try:
         import pypdf
     except Exception as exc:  # noqa: BLE001
-        return None, f"pypdf unavailable: {exc}"
+        return None, ExtractorOpenDebug(
+            extractor_name="pypdf",
+            import_available=False,
+            open_attempted=False,
+            open_succeeded=False,
+            error=f"import failed: {exc}",
+        )
 
     try:
         reader = pypdf.PdfReader(str(pdf_path))
     except Exception as exc:  # noqa: BLE001
-        return None, f"pypdf open failed: {exc}"
+        return None, ExtractorOpenDebug(
+            extractor_name="pypdf",
+            import_available=True,
+            open_attempted=True,
+            open_succeeded=False,
+            error=f"open failed: {exc}",
+        )
 
     if getattr(reader, "is_encrypted", False):
         try:
@@ -198,7 +244,13 @@ def _open_pypdf_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, str | N
         except Exception:  # noqa: BLE001
             unlocked = 0
         if unlocked == 0:
-            return None, "pypdf password-protected"
+            return None, ExtractorOpenDebug(
+                extractor_name="pypdf",
+                import_available=True,
+                open_attempted=True,
+                open_succeeded=False,
+                error="password-protected",
+            )
 
     def extract_page_text(page_index: int) -> Tuple[str, str | None]:
         try:
@@ -213,20 +265,38 @@ def _open_pypdf_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, str | N
             extract_page_text=extract_page_text,
             close=lambda: None,
         ),
-        None,
+        ExtractorOpenDebug(
+            extractor_name="pypdf",
+            import_available=True,
+            open_attempted=True,
+            open_succeeded=True,
+            error=None,
+        ),
     )
 
 
-def _open_pdfplumber_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, str | None]:
+def _open_pdfplumber_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, ExtractorOpenDebug]:
     try:
         import pdfplumber
     except Exception as exc:  # noqa: BLE001
-        return None, f"pdfplumber unavailable: {exc}"
+        return None, ExtractorOpenDebug(
+            extractor_name="pdfplumber",
+            import_available=False,
+            open_attempted=False,
+            open_succeeded=False,
+            error=f"import failed: {exc}",
+        )
 
     try:
         pdf_doc = pdfplumber.open(str(pdf_path))
     except Exception as exc:  # noqa: BLE001
-        return None, f"pdfplumber open failed: {exc}"
+        return None, ExtractorOpenDebug(
+            extractor_name="pdfplumber",
+            import_available=True,
+            open_attempted=True,
+            open_succeeded=False,
+            error=f"open failed: {exc}",
+        )
 
     def extract_page_text(page_index: int) -> Tuple[str, str | None]:
         try:
@@ -247,43 +317,202 @@ def _open_pdfplumber_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, st
             extract_page_text=extract_page_text,
             close=close,
         ),
-        None,
+        ExtractorOpenDebug(
+            extractor_name="pdfplumber",
+            import_available=True,
+            open_attempted=True,
+            open_succeeded=True,
+            error=None,
+        ),
     )
 
 
-def _build_pdf_extractors(pdf_path: Path) -> Tuple[List[_PdfExtractor], dict[str, str]]:
-    extractors: List[_PdfExtractor] = []
-    errors: dict[str, str] = {}
+def _open_pymupdf_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, ExtractorOpenDebug]:
+    try:
+        import fitz
+    except Exception as exc:  # noqa: BLE001
+        return None, ExtractorOpenDebug(
+            extractor_name="pymupdf",
+            import_available=False,
+            open_attempted=False,
+            open_succeeded=False,
+            error=f"import failed: {exc}",
+        )
+
+    try:
+        pdf_doc = fitz.open(str(pdf_path))
+    except Exception as exc:  # noqa: BLE001
+        return None, ExtractorOpenDebug(
+            extractor_name="pymupdf",
+            import_available=True,
+            open_attempted=True,
+            open_succeeded=False,
+            error=f"open failed: {exc}",
+        )
+
+    if getattr(pdf_doc, "needs_pass", False):
+        try:
+            unlocked = pdf_doc.authenticate("")
+        except Exception:  # noqa: BLE001
+            unlocked = False
+        if not unlocked:
+            try:
+                pdf_doc.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return None, ExtractorOpenDebug(
+                extractor_name="pymupdf",
+                import_available=True,
+                open_attempted=True,
+                open_succeeded=False,
+                error="password-protected",
+            )
+
+    def extract_page_text(page_index: int) -> Tuple[str, str | None]:
+        try:
+            page = pdf_doc.load_page(page_index)
+            return page.get_text("text") or "", None
+        except Exception as exc:  # noqa: BLE001
+            return "", str(exc)
+
+    def close() -> None:
+        try:
+            pdf_doc.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    return (
+        _PdfExtractor(
+            name="pymupdf",
+            page_count=int(pdf_doc.page_count),
+            extract_page_text=extract_page_text,
+            close=close,
+        ),
+        ExtractorOpenDebug(
+            extractor_name="pymupdf",
+            import_available=True,
+            open_attempted=True,
+            open_succeeded=True,
+            error=None,
+        ),
+    )
+
+
+def _open_pdftotext_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, ExtractorOpenDebug]:
+    pdftotext_path = shutil.which("pdftotext")
+    if not pdftotext_path:
+        return None, ExtractorOpenDebug(
+            extractor_name="pdftotext",
+            import_available=False,
+            open_attempted=False,
+            open_succeeded=False,
+            error="command not found",
+        )
+
+    command = [
+        pdftotext_path,
+        "-enc",
+        "UTF-8",
+        "-layout",
+        "-q",
+        str(pdf_path),
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return None, ExtractorOpenDebug(
+            extractor_name="pdftotext",
+            import_available=True,
+            open_attempted=True,
+            open_succeeded=False,
+            error=f"command failed: {exc}",
+        )
+
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        return None, ExtractorOpenDebug(
+            extractor_name="pdftotext",
+            import_available=True,
+            open_attempted=True,
+            open_succeeded=False,
+            error=f"pdftotext exit {result.returncode}: {stderr or 'no stderr'}",
+        )
+
+    page_texts = result.stdout.split("\f")
+    if page_texts and page_texts[-1] == "":
+        page_texts = page_texts[:-1]
+    if not page_texts:
+        page_texts = [""]
+
+    def extract_page_text(page_index: int) -> Tuple[str, str | None]:
+        if page_index < 0 or page_index >= len(page_texts):
+            return "", "page unavailable for pdftotext output"
+        return page_texts[page_index], None
+
+    return (
+        _PdfExtractor(
+            name="pdftotext",
+            page_count=len(page_texts),
+            extract_page_text=extract_page_text,
+            close=lambda: None,
+        ),
+        ExtractorOpenDebug(
+            extractor_name="pdftotext",
+            import_available=True,
+            open_attempted=True,
+            open_succeeded=True,
+            error=None,
+        ),
+    )
+
+
+def _build_pdf_extractors(
+    pdf_path: Path,
+) -> Tuple[dict[str, _PdfExtractor], dict[str, ExtractorOpenDebug]]:
+    extractors: dict[str, _PdfExtractor] = {}
+    open_debug: dict[str, ExtractorOpenDebug] = {}
 
     for extractor_name, opener in (
         ("PyPDF2", _open_pypdf2_extractor),
         ("pypdf", _open_pypdf_extractor),
         ("pdfplumber", _open_pdfplumber_extractor),
+        ("pymupdf", _open_pymupdf_extractor),
+        ("pdftotext", _open_pdftotext_extractor),
     ):
-        extractor, error = opener(pdf_path)
+        extractor, extractor_debug = opener(pdf_path)
+        open_debug[extractor_name] = extractor_debug
         if extractor:
-            extractors.append(extractor)
-        elif error:
-            errors[extractor_name] = error
+            extractors[extractor_name] = extractor
 
-    return extractors, errors
+    return extractors, open_debug
 
 
 def collect_pdf_pages(
     pdf_files: Sequence[Path],
     include_debug: bool = False,
+    max_pages_per_file: int | None = None,
 ) -> Tuple[List[PageRecord], List[str]] | Tuple[List[PageRecord], List[str], List[FileExtractionDebug]]:
     """Extract page-level text from PDF files, skipping unreadable inputs."""
 
     page_records: List[PageRecord] = []
     skipped_files: List[str] = []
     file_debug_entries: List[FileExtractionDebug] = []
-    extractor_order = ["PyPDF2", "pypdf", "pdfplumber"]
+    extractor_order = EXTRACTOR_ORDER
 
     for pdf_path in pdf_files:
-        extractors, open_errors = _build_pdf_extractors(pdf_path)
+        extractors, open_debug = _build_pdf_extractors(pdf_path)
         if not extractors:
-            error_context = "; ".join(open_errors.values()) if open_errors else "unknown error"
+            error_context = "; ".join(
+                debug.error for debug in open_debug.values() if debug.error
+            ) or "unknown error"
             skip_reason = f"unreadable by all extractors: {error_context}"
             skipped_files.append(f"{pdf_path} ({skip_reason})")
             if include_debug:
@@ -292,16 +521,17 @@ def collect_pdf_pages(
                         file_name=pdf_path.name,
                         file_path=str(pdf_path),
                         page_debug=[],
-                        open_errors=open_errors,
+                        extractor_open_debug=[open_debug[name] for name in extractor_order if name in open_debug],
                         skipped=True,
                         skip_reason=skip_reason,
                     )
                 )
             continue
 
-        extractor_by_name = {extractor.name: extractor for extractor in extractors}
         file_has_text = False
-        max_page_count = max(extractor.page_count for extractor in extractors)
+        max_page_count = max(extractor.page_count for extractor in extractors.values())
+        if max_pages_per_file is not None:
+            max_page_count = min(max_page_count, max_pages_per_file)
         page_debug_entries: List[PageExtractionDebug] = []
 
         try:
@@ -311,16 +541,45 @@ def collect_pdf_pages(
                 attempt_debug: List[ExtractorAttemptDebug] = []
 
                 for extractor_name in extractor_order:
-                    extractor = extractor_by_name.get(extractor_name)
-                    if not extractor:
+                    extractor_status = open_debug.get(extractor_name)
+                    extractor = extractors.get(extractor_name)
+                    if extractor_status is None:
+                        extractor_status = ExtractorOpenDebug(
+                            extractor_name=extractor_name,
+                            import_available=False,
+                            open_attempted=False,
+                            open_succeeded=False,
+                            error="not configured",
+                        )
+
+                    if successful_extractor:
                         attempt_debug.append(
                             ExtractorAttemptDebug(
                                 extractor_name=extractor_name,
+                                import_available=extractor_status.import_available,
+                                open_attempted=extractor_status.open_attempted,
+                                extraction_attempted=False,
                                 succeeded=False,
                                 character_count=0,
                                 whitespace_only=True,
                                 preview="",
-                                error=open_errors.get(extractor_name, "not available"),
+                                error=f"skipped after winner: {successful_extractor}",
+                            )
+                        )
+                        continue
+
+                    if not extractor:
+                        attempt_debug.append(
+                            ExtractorAttemptDebug(
+                                extractor_name=extractor_name,
+                                import_available=extractor_status.import_available,
+                                open_attempted=extractor_status.open_attempted,
+                                extraction_attempted=False,
+                                succeeded=False,
+                                character_count=0,
+                                whitespace_only=True,
+                                preview="",
+                                error=extractor_status.error or "not available",
                             )
                         )
                         continue
@@ -329,6 +588,9 @@ def collect_pdf_pages(
                         attempt_debug.append(
                             ExtractorAttemptDebug(
                                 extractor_name=extractor_name,
+                                import_available=extractor_status.import_available,
+                                open_attempted=extractor_status.open_attempted,
+                                extraction_attempted=False,
                                 succeeded=False,
                                 character_count=0,
                                 whitespace_only=True,
@@ -347,6 +609,9 @@ def collect_pdf_pages(
                         attempt_debug.append(
                             ExtractorAttemptDebug(
                                 extractor_name=extractor_name,
+                                import_available=extractor_status.import_available,
+                                open_attempted=extractor_status.open_attempted,
+                                extraction_attempted=True,
                                 succeeded=False,
                                 character_count=0,
                                 whitespace_only=True,
@@ -360,6 +625,9 @@ def collect_pdf_pages(
                     attempt_debug.append(
                         ExtractorAttemptDebug(
                             extractor_name=extractor_name,
+                            import_available=extractor_status.import_available,
+                            open_attempted=extractor_status.open_attempted,
+                            extraction_attempted=True,
                             succeeded=not is_whitespace_only,
                             character_count=character_count,
                             whitespace_only=is_whitespace_only,
@@ -369,7 +637,6 @@ def collect_pdf_pages(
                     )
                     if normalized_text:
                         successful_extractor = extractor_name
-                        break
 
                 extracted = bool(normalized_text)
                 page_debug_entries.append(
@@ -399,12 +666,12 @@ def collect_pdf_pages(
                     )
                 )
         finally:
-            for extractor in extractors:
+            for extractor in extractors.values():
                 extractor.close()
 
         file_skip_reason: str | None = None
         if not file_has_text:
-            file_skip_reason = "no extractable text after PyPDF2, pypdf, and pdfplumber"
+            file_skip_reason = "no extractable text after PyPDF2, pypdf, pdfplumber, pymupdf, and pdftotext"
             skipped_files.append(f"{pdf_path} ({file_skip_reason})")
 
         if include_debug:
@@ -413,7 +680,7 @@ def collect_pdf_pages(
                     file_name=pdf_path.name,
                     file_path=str(pdf_path),
                     page_debug=page_debug_entries,
-                    open_errors=open_errors,
+                    extractor_open_debug=[open_debug[name] for name in extractor_order if name in open_debug],
                     skipped=not file_has_text,
                     skip_reason=file_skip_reason,
                 )
