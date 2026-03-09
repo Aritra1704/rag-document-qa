@@ -27,13 +27,19 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-3. (Optional, for Q&A answers via Claude) set your API key:
+3. Install Tesseract (required for OCR fallback on scanned/image PDFs):
+
+```bash
+brew install tesseract
+```
+
+4. (Optional, for Q&A answers via Claude) set your API key:
 
 ```bash
 export ANTHROPIC_API_KEY="your_key_here"
 ```
 
-4. Run the Streamlit app:
+5. Run the Streamlit app:
 
 ```bash
 streamlit run src/app.py
@@ -74,27 +80,36 @@ Select `Workflow -> PDF Name Search`, then provide on the same page:
 
 - `Folder Path` (example: `/Users/aritra/Documents/pdfs`)
 - `Name to Search` (example: `John Smith`)
+- `Start page` (default `3`, scan begins from this page in every PDF)
+- `Enable OCR fallback` (only used when all standard extractors fail on a page)
+- `OCR timeout per page (seconds)`
+- `Overall timeout (seconds, 0 = no timeout)`
 - Click `Search PDFs`
 
 UI output includes:
 
 - total PDFs found
 - total matches found
+- scans all discovered PDFs progressively (not limited to a tiny file/page cap)
 - searched name
 - file name
 - full file path
 - page number
 - match position/index
 - snippet/context around each match
-- `match_type=exact`
+- `match_type=exact_text` (direct text extractor) or `match_type=ocr_text` (OCR fallback)
 - skipped file warnings (corrupted/password-protected/no text)
 - clear not-found message when there are no matches
+- live scan status: file index, file name, page number, stage, elapsed time, skipped counts
+- partial matches rendered during the scan (not only at the end)
+- final stop reason: completed all files / overall timeout / interrupted run
 
 Optional diagnostics:
 
 - Enable `Show extraction debug details` to inspect per-file/per-page extractor attempts
 - Includes attempted extractor order, successful extractor, char counts, whitespace-only status, preview text, and errors
-- Includes environment diagnostics (`sys.executable`, `sys.version`, extractor importability, and `pdftotext` command availability)
+- Includes OCR fallback diagnostics (attempted/success, OCR char count, preview text, OCR error message)
+- Includes environment diagnostics (`sys.executable`, `sys.version`, extractor/OCR importability, and `pdftotext`/`tesseract` command availability)
 - Includes a quick one-file diagnostic action (first 3 pages) for fast troubleshooting
 - Detailed page-level diagnostics are capped in the UI for responsiveness, while summary metrics still cover all scanned files/pages
 
@@ -106,6 +121,8 @@ Optional diagnostics:
 - Phase 1 UI input is a single name per search
 - Page-by-page matching
 - Text extraction fallback order: `PyPDF2 -> pypdf -> pdfplumber -> PyMuPDF(fitz) -> pdftotext` (when available)
+- OCR fallback: if all extractors return empty/whitespace for a page, OCR is attempted and used for matching
+- OCR fallback respects per-page OCR timeout to avoid stalling on one page
 - Match position/index is captured from page text
 - Snippet extraction around each match (not full page dump)
 - Multiple matches on same page are returned, with duplicate suppression

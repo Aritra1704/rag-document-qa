@@ -19,7 +19,7 @@ import logging
 from typing import List, Tuple, Optional
 from name_finder import (
     collect_pdf_pages,
-    run_name_search,
+    run_name_search_progressive,
     summarize_extraction_debug,
 )
 from ollama_rag import (
@@ -106,6 +106,20 @@ if 'name_search_show_debug' not in st.session_state:
     st.session_state.name_search_show_debug = False
 if 'name_search_quick_debug' not in st.session_state:
     st.session_state.name_search_quick_debug = None
+if 'name_search_start_page' not in st.session_state:
+    st.session_state.name_search_start_page = 3
+if 'name_search_enable_ocr_fallback' not in st.session_state:
+    st.session_state.name_search_enable_ocr_fallback = True
+if 'name_search_ocr_timeout_seconds' not in st.session_state:
+    st.session_state.name_search_ocr_timeout_seconds = 20
+if 'name_search_overall_timeout_seconds' not in st.session_state:
+    st.session_state.name_search_overall_timeout_seconds = 0
+if 'name_search_scan_in_progress' not in st.session_state:
+    st.session_state.name_search_scan_in_progress = False
+if 'name_search_partial_results' not in st.session_state:
+    st.session_state.name_search_partial_results = []
+if 'name_search_last_stop_reason' not in st.session_state:
+    st.session_state.name_search_last_stop_reason = None
 if 'ollama_collection' not in st.session_state:
     st.session_state.ollama_collection = None
 if 'ollama_documents_processed' not in st.session_state:
@@ -602,15 +616,63 @@ def show_name_search_workflow():
         placeholder="John Smith",
         help="Exact name to search for (case-insensitive)",
     )
+    start_page = st.number_input(
+        "Start page",
+        min_value=1,
+        value=int(st.session_state.get("name_search_start_page", 3)),
+        step=1,
+        help="For each PDF, start scanning at this page number.",
+    )
+    enable_ocr_fallback = st.checkbox(
+        "Enable OCR fallback",
+        value=bool(st.session_state.get("name_search_enable_ocr_fallback", True)),
+        help="Use OCR only when all standard extractors return empty/whitespace text.",
+    )
+    ocr_timeout_seconds = st.number_input(
+        "OCR timeout per page (seconds)",
+        min_value=1,
+        value=int(st.session_state.get("name_search_ocr_timeout_seconds", 20)),
+        step=1,
+        help="Maximum OCR time per page when OCR fallback is used.",
+        disabled=not enable_ocr_fallback,
+    )
+    overall_timeout_seconds = st.number_input(
+        "Overall timeout (seconds, 0 = no timeout)",
+        min_value=0,
+        value=int(st.session_state.get("name_search_overall_timeout_seconds", 0)),
+        step=5,
+        help="Optional total runtime limit for the full scan across all files.",
+    )
     st.checkbox(
         "Show extraction debug details",
         key="name_search_show_debug",
         help="Show file/page-level extractor attempts to debug text extraction issues",
     )
 
+    if st.session_state.get("name_search_scan_in_progress", False):
+        st.warning("The previous scan appears interrupted by rerun/user action. Showing saved partial results.")
+        st.session_state.name_search_scan_in_progress = False
+        st.session_state.name_search_last_stop_reason = "interrupted by rerun/user action"
+
+    def _format_match_block(match) -> str:
+        return (
+            f"Name: {match.searched_name}\n"
+            f"File: {match.file_name}\n"
+            f"Path: {match.file_path}\n"
+            f"Page: {match.page_number}\n"
+            f"Position: {match.match_position}\n"
+            f"Match Type: {match.match_type}\n"
+            f'Snippet: "{match.snippet}"\n'
+            "--------------------------------------------------"
+        )
+
     if st.button("Search PDFs", type="primary"):
         st.session_state.name_search_folder_path = folder_path
         st.session_state.name_search_name = name_input
+        st.session_state.name_search_start_page = int(start_page)
+        st.session_state.name_search_enable_ocr_fallback = bool(enable_ocr_fallback)
+        st.session_state.name_search_ocr_timeout_seconds = int(ocr_timeout_seconds)
+        st.session_state.name_search_overall_timeout_seconds = int(overall_timeout_seconds)
 
         if not folder_path.strip():
             st.session_state.name_search_outcome = None
@@ -625,21 +687,109 @@ def show_name_search_workflow():
                 st.error(f"Folder path does not exist or is not a directory: {resolved_folder}")
             else:
                 try:
-                    with st.spinner("Scanning PDFs and searching for exact matches..."):
-                        outcome = run_name_search(
+                    st.session_state.name_search_outcome = None
+                    st.session_state.name_search_partial_results = []
+                    st.session_state.name_search_scan_in_progress = True
+                    st.session_state.name_search_last_stop_reason = "running"
+
+                    live_status_placeholder = st.empty()
+                    live_metrics_placeholder = st.empty()
+                    live_progress_bar = st.progress(0.0)
+                    partial_results_container = st.container()
+
+                    def _on_progress(update: dict):
+                        total_files = int(update.get("total_files", 0))
+                        current_file_index = int(update.get("current_file_index", 0))
+                        current_file_name = str(update.get("current_file_name", ""))
+                        current_page_number = int(update.get("current_page_number", 0))
+                        current_file_total_pages = int(update.get("current_file_total_pages", 0))
+                        stage = str(update.get("stage", ""))
+                        pages_processed = int(update.get("pages_processed", 0))
+                        matches_found = int(update.get("total_matches_found", 0))
+                        skipped_pages = int(update.get("skipped_pages", 0))
+                        skipped_files = int(update.get("skipped_files", 0))
+                        ocr_timeout_pages = int(update.get("ocr_timeout_pages", 0))
+                        elapsed_seconds = float(update.get("elapsed_seconds", 0.0))
+                        new_matches = list(update.get("new_matches", []))
+
+                        live_status_placeholder.markdown(
+                            "\n".join(
+                                [
+                                    "### Live Scan Status",
+                                    f"- File: {current_file_index} / {total_files}",
+                                    f"- Current file: `{current_file_name}`",
+                                    f"- Page: {current_page_number} / {current_file_total_pages}",
+                                    f"- Stage: {stage}",
+                                ]
+                            )
+                        )
+                        live_metrics_placeholder.markdown(
+                            "\n".join(
+                                [
+                                    f"- Pages processed: {pages_processed}",
+                                    f"- Matches found: {matches_found}",
+                                    f"- Elapsed: {elapsed_seconds:.1f}s",
+                                    f"- Skipped pages/files: {skipped_pages} / {skipped_files}",
+                                    f"- OCR timeout pages: {ocr_timeout_pages}",
+                                ]
+                            )
+                        )
+
+                        progress_fraction = 0.0
+                        if total_files > 0:
+                            file_fraction = 0.0
+                            if current_file_total_pages > 0 and current_page_number > 0:
+                                file_fraction = min(current_page_number / current_file_total_pages, 1.0)
+                            progress_fraction = min(((max(current_file_index - 1, 0)) + file_fraction) / total_files, 1.0)
+                        live_progress_bar.progress(progress_fraction)
+
+                        if new_matches:
+                            st.session_state.name_search_partial_results.extend(new_matches)
+                            partial_results_container.markdown("### Partial Matches (Live)")
+                            for match in new_matches:
+                                partial_results_container.code(_format_match_block(match), language="text")
+
+                    with st.spinner("Scanning all PDFs progressively..."):
+                        outcome = run_name_search_progressive(
                             folder_path=folder_path,
                             raw_names=name_input,
-                            enable_semantic_fallback=False,
+                            start_page=int(start_page),
+                            enable_ocr_fallback=bool(enable_ocr_fallback),
+                            ocr_timeout_per_page=float(ocr_timeout_seconds) if enable_ocr_fallback else None,
+                            overall_timeout_seconds=float(overall_timeout_seconds) if overall_timeout_seconds > 0 else None,
+                            progress_callback=_on_progress,
                         )
                 except ValueError as exc:
                     st.session_state.name_search_outcome = None
                     st.error(str(exc))
+                except BaseException as exc:  # noqa: BLE001
+                    if exc.__class__.__name__ in {"RerunException", "StopException"}:
+                        st.session_state.name_search_last_stop_reason = "interrupted by rerun/user action"
+                    raise
                 else:
                     st.session_state.name_search_outcome = outcome
-                    st.success(f"Search complete. PDFs discovered: {len(outcome.pdf_files)}")
+                    st.session_state.name_search_partial_results = list(outcome.results)
+                    st.session_state.name_search_last_stop_reason = outcome.stop_reason
+                    if outcome.scan_completed:
+                        st.success(
+                            f"Scan complete. PDFs discovered: {len(outcome.pdf_files)} | stop reason: {outcome.stop_reason}"
+                        )
+                    else:
+                        st.warning(
+                            f"Scan stopped early. PDFs discovered: {len(outcome.pdf_files)} | stop reason: {outcome.stop_reason}"
+                        )
+                finally:
+                    st.session_state.name_search_scan_in_progress = False
 
     outcome = st.session_state.get("name_search_outcome")
     if not outcome:
+        partial_results = st.session_state.get("name_search_partial_results", [])
+        last_stop_reason = st.session_state.get("name_search_last_stop_reason")
+        if partial_results and last_stop_reason == "interrupted by rerun/user action":
+            st.warning("Last run was interrupted by rerun/user action. Showing preserved partial results.")
+            for match in partial_results:
+                st.code(_format_match_block(match), language="text")
+            return
         st.info("Enter a folder path and a name, then click 'Search PDFs'.")
         return
 
@@ -650,6 +800,25 @@ def show_name_search_workflow():
     with col2:
         st.metric("Total Matches Found", len(outcome.results))
 
+    scan_completed = bool(getattr(outcome, "scan_completed", True))
+    stop_reason = str(getattr(outcome, "stop_reason", "completed all files"))
+    pages_processed = int(getattr(outcome, "pages_processed", 0))
+    skipped_pages_count = int(getattr(outcome, "skipped_pages", 0))
+    skipped_files_count = int(getattr(outcome, "skipped_files_count", len(outcome.skipped_files)))
+    ocr_timeout_pages = int(getattr(outcome, "ocr_timeout_pages", 0))
+    elapsed_seconds = float(getattr(outcome, "elapsed_seconds", 0.0))
+
+    status_prefix = "Run completed" if scan_completed else "Run stopped early"
+    if scan_completed:
+        st.success(f"{status_prefix}: {stop_reason}")
+    else:
+        st.warning(f"{status_prefix}: {stop_reason}")
+    st.caption(
+        f"Pages processed: {pages_processed} | Skipped pages: {skipped_pages_count} | "
+        f"Skipped files: {skipped_files_count} | OCR timeout pages: {ocr_timeout_pages} | "
+        f"Elapsed: {elapsed_seconds:.1f}s"
+    )
+
     if not outcome.pdf_files:
         st.warning("No PDF files were discovered in the selected folder.")
 
@@ -659,22 +828,14 @@ def show_name_search_workflow():
                 st.write(f"- {skipped}")
 
     searched_name = outcome.names[0] if outcome.names else name_input.strip()
-    exact_matches = [match for match in outcome.results if match.match_type == "exact"]
-    if not exact_matches:
+    deterministic_matches = [
+        match for match in outcome.results if match.match_type in {"exact_text", "ocr_text", "exact"}
+    ]
+    if not deterministic_matches:
         st.info(f'No matches found for "{searched_name}"')
     else:
-        for match in exact_matches:
-            match_block = (
-                f"Name: {match.searched_name}\n"
-                f"File: {match.file_name}\n"
-                f"Path: {match.file_path}\n"
-                f"Page: {match.page_number}\n"
-                f"Position: {match.match_position}\n"
-                f"Match Type: {match.match_type}\n"
-                f'Snippet: "{match.snippet}"\n'
-                "--------------------------------------------------"
-            )
-            st.code(match_block, language="text")
+        for match in deterministic_matches:
+            st.code(_format_match_block(match), language="text")
 
     if st.session_state.get("name_search_show_debug", False):
         debug_entries = outcome.extraction_debug
@@ -694,6 +855,9 @@ def show_name_search_workflow():
             {"Metric": "pypdf importable", "Value": yes_no(importlib.util.find_spec("pypdf") is not None)},
             {"Metric": "pdfplumber importable", "Value": yes_no(importlib.util.find_spec("pdfplumber") is not None)},
             {"Metric": "PyMuPDF (fitz) importable", "Value": yes_no(importlib.util.find_spec("fitz") is not None)},
+            {"Metric": "pytesseract importable", "Value": yes_no(importlib.util.find_spec("pytesseract") is not None)},
+            {"Metric": "Pillow (PIL) importable", "Value": yes_no(importlib.util.find_spec("PIL") is not None)},
+            {"Metric": "tesseract command available", "Value": yes_no(shutil.which("tesseract") is not None)},
             {"Metric": "pdftotext command available", "Value": yes_no(shutil.which("pdftotext") is not None)},
         ]
         st.dataframe(env_rows, use_container_width=True, hide_index=True)
@@ -726,10 +890,14 @@ def show_name_search_workflow():
                 key="name_search_quick_pdf",
             )
             if st.button("Run quick diagnostic for selected file", key="run_quick_pdf_diagnostic"):
+                quick_enable_ocr = bool(st.session_state.get("name_search_enable_ocr_fallback", True))
+                quick_ocr_timeout = int(st.session_state.get("name_search_ocr_timeout_seconds", 20))
                 quick_pages, quick_skipped, quick_debug_entries = collect_pdf_pages(
                     [Path(quick_pdf_path)],
                     include_debug=True,
                     max_pages_per_file=3,
+                    enable_ocr_fallback=quick_enable_ocr,
+                    ocr_timeout_per_page=float(quick_ocr_timeout) if quick_enable_ocr else None,
                 )
                 st.session_state.name_search_quick_debug = {
                     "pdf_path": quick_pdf_path,
@@ -752,28 +920,63 @@ def show_name_search_workflow():
                 quick_rows = []
                 for quick_file_debug in quick_debug_payload.get("debug_entries", []):
                     for page_debug in quick_file_debug.page_debug:
-                        winning = page_debug.successful_extractor or "none"
+                        page_ocr_attempted = bool(getattr(page_debug, "ocr_attempted", False))
+                        page_ocr_succeeded = bool(getattr(page_debug, "ocr_succeeded", False))
+                        page_ocr_character_count = int(getattr(page_debug, "ocr_character_count", 0) or 0)
+                        page_ocr_preview = str(getattr(page_debug, "ocr_preview", "") or "")
+                        page_ocr_error = str(getattr(page_debug, "ocr_error", "") or "")
                         for attempt in page_debug.attempts:
                             quick_rows.append(
                                 {
-                                    "File Path": page_debug.file_path,
-                                    "Page": page_debug.page_number,
-                                    "Extractor": attempt.extractor_name,
-                                    "Import Available": yes_no(attempt.import_available),
-                                    "Open Attempted": yes_no(attempt.open_attempted),
-                                    "Extraction Attempted": yes_no(attempt.extraction_attempted),
-                                    "Success": yes_no(attempt.succeeded),
-                                    "Characters": attempt.character_count,
-                                    "Whitespace Only": yes_no(attempt.whitespace_only),
-                                    "Preview": attempt.preview[:100],
-                                    "Error": attempt.error or "",
-                                    "Winning Extractor": winning,
+                                    "file_path": page_debug.file_path,
+                                    "page_number": page_debug.page_number,
+                                    "extractor_name": attempt.extractor_name,
+                                    "import_available": attempt.import_available,
+                                    "open_attempted": attempt.open_attempted,
+                                    "extraction_attempted": attempt.extraction_attempted,
+                                    "success": attempt.succeeded,
+                                    "extracted_char_count": attempt.character_count,
+                                    "whitespace_only": attempt.whitespace_only,
+                                    "preview_text_first_150_chars": attempt.preview,
+                                    "error_message": attempt.error or "",
+                                    "selected_as_winner": attempt.extractor_name == page_debug.successful_extractor,
+                                    "ocr_attempted": page_ocr_attempted,
+                                    "ocr_success": page_ocr_succeeded,
+                                    "ocr_extracted_char_count": page_ocr_character_count,
+                                    "ocr_preview_text_first_150_chars": page_ocr_preview,
+                                    "ocr_error_message": page_ocr_error,
                                 }
                             )
                 if quick_rows:
                     st.dataframe(quick_rows, use_container_width=True, hide_index=True)
                 else:
                     st.caption("No quick page-level attempts available.")
+
+                raw_winner_sections = []
+                for quick_file_debug in quick_debug_payload.get("debug_entries", []):
+                    for page_debug in quick_file_debug.page_debug:
+                        winning_extractor = page_debug.successful_extractor or "none"
+                        raw_winning_text = page_debug.winning_raw_text_first_500
+                        if not page_debug.successful_extractor:
+                            raw_winning_text = "[no winning extractor selected for this page]"
+                        elif raw_winning_text == "":
+                            raw_winning_text = "[winning extractor returned empty text]"
+
+                        raw_winner_sections.append(
+                            "\n".join(
+                                [
+                                    f"file_path: {page_debug.file_path}",
+                                    f"page_number: {page_debug.page_number}",
+                                    f"winning_extractor: {winning_extractor}",
+                                    "winning_text_first_500_chars:",
+                                    raw_winning_text,
+                                ]
+                            )
+                        )
+
+                if raw_winner_sections:
+                    st.write("Raw winner text by page (quick diagnostic):")
+                    st.code("\n\n".join(raw_winner_sections), language="text")
         else:
             st.caption("No PDFs were discovered, so quick diagnostics are unavailable.")
 
@@ -824,6 +1027,11 @@ def show_name_search_workflow():
                 page_rows = []
                 for page_debug in file_debug.page_debug[:max_debug_pages_per_file]:
                     successful_extractor = page_debug.successful_extractor or "none"
+                    page_ocr_attempted = bool(getattr(page_debug, "ocr_attempted", False))
+                    page_ocr_succeeded = bool(getattr(page_debug, "ocr_succeeded", False))
+                    page_ocr_character_count = int(getattr(page_debug, "ocr_character_count", 0) or 0)
+                    page_ocr_preview = str(getattr(page_debug, "ocr_preview", "") or "")
+                    page_ocr_error = str(getattr(page_debug, "ocr_error", "") or "")
                     for attempt in page_debug.attempts:
                         page_rows.append(
                             {
@@ -839,6 +1047,11 @@ def show_name_search_workflow():
                                 "Preview": attempt.preview[:100],
                                 "Error": attempt.error or "",
                                 "Winning Extractor": successful_extractor,
+                                "OCR Attempted": yes_no(page_ocr_attempted),
+                                "OCR Success": yes_no(page_ocr_succeeded),
+                                "OCR Characters": page_ocr_character_count,
+                                "OCR Preview": page_ocr_preview[:100],
+                                "OCR Error": page_ocr_error,
                                 "Page Status": "skipped" if page_debug.skipped else "extracted",
                             }
                         )

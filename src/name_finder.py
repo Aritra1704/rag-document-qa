@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import csv
+import io
 import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -34,6 +36,7 @@ class PageRecord:
     file_path: str
     page_number: int
     text: str
+    text_source: str = "exact_text"
 
 
 @dataclass(frozen=True)
@@ -44,7 +47,7 @@ class NameMatch:
     page_number: int
     match_position: int
     snippet: str
-    match_type: str = "exact"
+    match_type: str = "exact_text"
 
 
 @dataclass
@@ -55,6 +58,13 @@ class NameSearchOutcome:
     skipped_files: List[str]
     results: List[NameMatch]
     extraction_debug: List["FileExtractionDebug"] = field(default_factory=list)
+    scan_completed: bool = True
+    stop_reason: str = "completed all files"
+    pages_processed: int = 0
+    skipped_pages: int = 0
+    skipped_files_count: int = 0
+    ocr_timeout_pages: int = 0
+    elapsed_seconds: float = 0.0
 
     @property
     def names_without_matches(self) -> List[str]:
@@ -102,6 +112,12 @@ class PageExtractionDebug:
     whitespace_only: bool
     skipped: bool
     preview: str
+    winning_raw_text_first_500: str
+    ocr_attempted: bool
+    ocr_succeeded: bool
+    ocr_character_count: int
+    ocr_preview: str
+    ocr_error: str | None
     attempts: List[ExtractorAttemptDebug]
 
 
@@ -164,6 +180,87 @@ def _preview_text(text: str, max_chars: int = 160) -> str:
     if len(normalized) <= max_chars:
         return normalized
     return normalized[:max_chars].rstrip() + " ..."
+
+
+def _raw_preview_text(text: str, max_chars: int) -> str:
+    if not text:
+        return ""
+    return text[:max_chars]
+
+
+def _extract_page_text_with_ocr(
+    pdf_path: Path,
+    page_index: int,
+    timeout_seconds: float | None = None,
+) -> Tuple[str, str | None]:
+    """OCR fallback for scanned pages using PyMuPDF rendering + Tesseract."""
+
+    try:
+        import fitz
+    except Exception as exc:  # noqa: BLE001
+        return "", f"OCR unavailable: PyMuPDF import failed: {exc}"
+
+    try:
+        import pytesseract
+    except Exception as exc:  # noqa: BLE001
+        return "", f"OCR unavailable: pytesseract import failed: {exc}"
+
+    try:
+        from PIL import Image
+    except Exception as exc:  # noqa: BLE001
+        return "", f"OCR unavailable: Pillow import failed: {exc}"
+
+    tesseract_path = shutil.which("tesseract")
+    if not tesseract_path:
+        return "", "OCR unavailable: tesseract command not found"
+
+    try:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_path
+    except Exception:  # noqa: BLE001
+        pass
+
+    pdf_doc = None
+    try:
+        pdf_doc = fitz.open(str(pdf_path))
+        if getattr(pdf_doc, "needs_pass", False):
+            try:
+                unlocked = pdf_doc.authenticate("")
+            except Exception:  # noqa: BLE001
+                unlocked = False
+            if not unlocked:
+                return "", "OCR unavailable: password-protected"
+
+        if page_index < 0 or page_index >= int(pdf_doc.page_count):
+            return "", "OCR page unavailable"
+
+        page = pdf_doc.load_page(page_index)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+        image_bytes = pix.tobytes("png")
+    except Exception as exc:  # noqa: BLE001
+        return "", f"OCR render failed: {exc}"
+    finally:
+        if pdf_doc is not None:
+            try:
+                pdf_doc.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            if timeout_seconds is not None and timeout_seconds > 0:
+                extracted_text = pytesseract.image_to_string(image, timeout=float(timeout_seconds)) or ""
+            else:
+                extracted_text = pytesseract.image_to_string(image) or ""
+    except RuntimeError as exc:
+        error_text = str(exc)
+        if "time" in error_text.lower():
+            timeout_display = int(timeout_seconds) if timeout_seconds else "configured"
+            return "", f"OCR timeout after {timeout_display}s"
+        return "", f"OCR failed: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return "", f"OCR failed: {exc}"
+
+    return extracted_text, None
 
 
 def _open_pypdf2_extractor(pdf_path: Path) -> Tuple[_PdfExtractor | None, ExtractorOpenDebug]:
@@ -495,10 +592,183 @@ def _build_pdf_extractors(
     return extractors, open_debug
 
 
+def _extract_page_with_fallback(
+    *,
+    pdf_path: Path,
+    page_index: int,
+    extractor_order: Sequence[str],
+    extractors: dict[str, _PdfExtractor],
+    open_debug: dict[str, ExtractorOpenDebug],
+    enable_ocr_fallback: bool,
+    ocr_timeout_per_page: float | None,
+) -> tuple[
+    str,
+    str,
+    str | None,
+    str,
+    List[ExtractorAttemptDebug],
+    bool,
+    bool,
+    int,
+    str,
+    str | None,
+]:
+    normalized_text = ""
+    winning_raw_text = ""
+    text_source = "exact_text"
+    successful_extractor: str | None = None
+    ocr_attempted = False
+    ocr_succeeded = False
+    ocr_character_count = 0
+    ocr_preview = ""
+    ocr_error: str | None = None
+    attempt_debug: List[ExtractorAttemptDebug] = []
+
+    for extractor_name in extractor_order:
+        extractor_status = open_debug.get(extractor_name)
+        extractor = extractors.get(extractor_name)
+        if extractor_status is None:
+            extractor_status = ExtractorOpenDebug(
+                extractor_name=extractor_name,
+                import_available=False,
+                open_attempted=False,
+                open_succeeded=False,
+                error="not configured",
+            )
+
+        if successful_extractor:
+            attempt_debug.append(
+                ExtractorAttemptDebug(
+                    extractor_name=extractor_name,
+                    import_available=extractor_status.import_available,
+                    open_attempted=extractor_status.open_attempted,
+                    extraction_attempted=False,
+                    succeeded=False,
+                    character_count=0,
+                    whitespace_only=True,
+                    preview="",
+                    error=f"skipped after winner: {successful_extractor}",
+                )
+            )
+            continue
+
+        if not extractor:
+            attempt_debug.append(
+                ExtractorAttemptDebug(
+                    extractor_name=extractor_name,
+                    import_available=extractor_status.import_available,
+                    open_attempted=extractor_status.open_attempted,
+                    extraction_attempted=False,
+                    succeeded=False,
+                    character_count=0,
+                    whitespace_only=True,
+                    preview="",
+                    error=extractor_status.error or "not available",
+                )
+            )
+            continue
+
+        if page_index >= extractor.page_count:
+            attempt_debug.append(
+                ExtractorAttemptDebug(
+                    extractor_name=extractor_name,
+                    import_available=extractor_status.import_available,
+                    open_attempted=extractor_status.open_attempted,
+                    extraction_attempted=False,
+                    succeeded=False,
+                    character_count=0,
+                    whitespace_only=True,
+                    preview="",
+                    error="page unavailable for this extractor",
+                )
+            )
+            continue
+
+        raw_text, extract_error = extractor.extract_page_text(page_index)
+        raw_text = raw_text or ""
+        raw_character_count = len(raw_text)
+        raw_whitespace_only = raw_character_count == 0 or raw_text.strip() == ""
+        normalized_candidate = _normalize_whitespace(raw_text)
+        is_whitespace_only = len(normalized_candidate) == 0
+        raw_preview = _raw_preview_text(raw_text, max_chars=150)
+
+        if extract_error:
+            attempt_debug.append(
+                ExtractorAttemptDebug(
+                    extractor_name=extractor_name,
+                    import_available=extractor_status.import_available,
+                    open_attempted=extractor_status.open_attempted,
+                    extraction_attempted=True,
+                    succeeded=False,
+                    character_count=raw_character_count,
+                    whitespace_only=raw_whitespace_only,
+                    preview=raw_preview,
+                    error=extract_error,
+                )
+            )
+            continue
+
+        attempt_debug.append(
+            ExtractorAttemptDebug(
+                extractor_name=extractor_name,
+                import_available=extractor_status.import_available,
+                open_attempted=extractor_status.open_attempted,
+                extraction_attempted=True,
+                succeeded=not is_whitespace_only,
+                character_count=raw_character_count,
+                whitespace_only=raw_whitespace_only,
+                preview=raw_preview,
+                error="empty/whitespace text" if is_whitespace_only else None,
+            )
+        )
+        if normalized_candidate:
+            successful_extractor = extractor_name
+            normalized_text = normalized_candidate
+            winning_raw_text = raw_text
+
+    if not normalized_text and enable_ocr_fallback:
+        ocr_attempted = True
+        ocr_raw_text, ocr_extract_error = _extract_page_text_with_ocr(
+            pdf_path,
+            page_index,
+            timeout_seconds=ocr_timeout_per_page,
+        )
+        ocr_raw_text = ocr_raw_text or ""
+        ocr_character_count = len(ocr_raw_text)
+        ocr_preview = _raw_preview_text(ocr_raw_text, max_chars=150)
+        normalized_ocr_text = _normalize_whitespace(ocr_raw_text)
+        if ocr_extract_error:
+            ocr_error = ocr_extract_error
+        elif not normalized_ocr_text:
+            ocr_error = "empty/whitespace OCR text"
+        else:
+            ocr_succeeded = True
+            text_source = "ocr_text"
+            successful_extractor = "ocr"
+            normalized_text = normalized_ocr_text
+            winning_raw_text = ocr_raw_text
+
+    return (
+        normalized_text,
+        text_source,
+        successful_extractor,
+        winning_raw_text,
+        attempt_debug,
+        ocr_attempted,
+        ocr_succeeded,
+        ocr_character_count,
+        ocr_preview,
+        ocr_error,
+    )
+
+
 def collect_pdf_pages(
     pdf_files: Sequence[Path],
     include_debug: bool = False,
     max_pages_per_file: int | None = None,
+    start_page: int = 1,
+    enable_ocr_fallback: bool = True,
+    ocr_timeout_per_page: float | None = None,
 ) -> Tuple[List[PageRecord], List[str]] | Tuple[List[PageRecord], List[str], List[FileExtractionDebug]]:
     """Extract page-level text from PDF files, skipping unreadable inputs."""
 
@@ -533,110 +803,30 @@ def collect_pdf_pages(
         if max_pages_per_file is not None:
             max_page_count = min(max_page_count, max_pages_per_file)
         page_debug_entries: List[PageExtractionDebug] = []
+        start_page_index = max(0, int(start_page) - 1)
 
         try:
-            for page_index in range(max_page_count):
-                normalized_text = ""
-                successful_extractor: str | None = None
-                attempt_debug: List[ExtractorAttemptDebug] = []
-
-                for extractor_name in extractor_order:
-                    extractor_status = open_debug.get(extractor_name)
-                    extractor = extractors.get(extractor_name)
-                    if extractor_status is None:
-                        extractor_status = ExtractorOpenDebug(
-                            extractor_name=extractor_name,
-                            import_available=False,
-                            open_attempted=False,
-                            open_succeeded=False,
-                            error="not configured",
-                        )
-
-                    if successful_extractor:
-                        attempt_debug.append(
-                            ExtractorAttemptDebug(
-                                extractor_name=extractor_name,
-                                import_available=extractor_status.import_available,
-                                open_attempted=extractor_status.open_attempted,
-                                extraction_attempted=False,
-                                succeeded=False,
-                                character_count=0,
-                                whitespace_only=True,
-                                preview="",
-                                error=f"skipped after winner: {successful_extractor}",
-                            )
-                        )
-                        continue
-
-                    if not extractor:
-                        attempt_debug.append(
-                            ExtractorAttemptDebug(
-                                extractor_name=extractor_name,
-                                import_available=extractor_status.import_available,
-                                open_attempted=extractor_status.open_attempted,
-                                extraction_attempted=False,
-                                succeeded=False,
-                                character_count=0,
-                                whitespace_only=True,
-                                preview="",
-                                error=extractor_status.error or "not available",
-                            )
-                        )
-                        continue
-
-                    if page_index >= extractor.page_count:
-                        attempt_debug.append(
-                            ExtractorAttemptDebug(
-                                extractor_name=extractor_name,
-                                import_available=extractor_status.import_available,
-                                open_attempted=extractor_status.open_attempted,
-                                extraction_attempted=False,
-                                succeeded=False,
-                                character_count=0,
-                                whitespace_only=True,
-                                preview="",
-                                error="page unavailable for this extractor",
-                            )
-                        )
-                        continue
-
-                    raw_text, extract_error = extractor.extract_page_text(page_index)
-                    normalized_text = _normalize_whitespace(raw_text)
-                    character_count = len(normalized_text)
-                    is_whitespace_only = character_count == 0
-
-                    if extract_error:
-                        attempt_debug.append(
-                            ExtractorAttemptDebug(
-                                extractor_name=extractor_name,
-                                import_available=extractor_status.import_available,
-                                open_attempted=extractor_status.open_attempted,
-                                extraction_attempted=True,
-                                succeeded=False,
-                                character_count=0,
-                                whitespace_only=True,
-                                preview="",
-                                error=extract_error,
-                            )
-                        )
-                        continue
-
-                    preview = _preview_text(normalized_text)
-                    attempt_debug.append(
-                        ExtractorAttemptDebug(
-                            extractor_name=extractor_name,
-                            import_available=extractor_status.import_available,
-                            open_attempted=extractor_status.open_attempted,
-                            extraction_attempted=True,
-                            succeeded=not is_whitespace_only,
-                            character_count=character_count,
-                            whitespace_only=is_whitespace_only,
-                            preview=preview,
-                            error="empty/whitespace text" if is_whitespace_only else None,
-                        )
-                    )
-                    if normalized_text:
-                        successful_extractor = extractor_name
+            for page_index in range(start_page_index, max_page_count):
+                (
+                    normalized_text,
+                    text_source,
+                    successful_extractor,
+                    winning_raw_text,
+                    attempt_debug,
+                    ocr_attempted,
+                    ocr_succeeded,
+                    ocr_character_count,
+                    ocr_preview,
+                    ocr_error,
+                ) = _extract_page_with_fallback(
+                    pdf_path=pdf_path,
+                    page_index=page_index,
+                    extractor_order=extractor_order,
+                    extractors=extractors,
+                    open_debug=open_debug,
+                    enable_ocr_fallback=enable_ocr_fallback,
+                    ocr_timeout_per_page=ocr_timeout_per_page,
+                )
 
                 extracted = bool(normalized_text)
                 page_debug_entries.append(
@@ -649,6 +839,12 @@ def collect_pdf_pages(
                         whitespace_only=not extracted,
                         skipped=not extracted,
                         preview=_preview_text(normalized_text),
+                        winning_raw_text_first_500=_raw_preview_text(winning_raw_text, max_chars=500),
+                        ocr_attempted=ocr_attempted,
+                        ocr_succeeded=ocr_succeeded,
+                        ocr_character_count=ocr_character_count,
+                        ocr_preview=ocr_preview,
+                        ocr_error=ocr_error,
                         attempts=attempt_debug,
                     )
                 )
@@ -663,6 +859,7 @@ def collect_pdf_pages(
                         file_path=str(pdf_path),
                         page_number=page_index + 1,
                         text=normalized_text,
+                        text_source=text_source,
                     )
                 )
         finally:
@@ -671,7 +868,14 @@ def collect_pdf_pages(
 
         file_skip_reason: str | None = None
         if not file_has_text:
-            file_skip_reason = "no extractable text after PyPDF2, pypdf, pdfplumber, pymupdf, and pdftotext"
+            if enable_ocr_fallback:
+                file_skip_reason = (
+                    "no extractable text after PyPDF2, pypdf, pdfplumber, pymupdf, pdftotext, and OCR fallback"
+                )
+            else:
+                file_skip_reason = (
+                    "no extractable text after PyPDF2, pypdf, pdfplumber, pymupdf, and pdftotext (OCR disabled)"
+                )
             skipped_files.append(f"{pdf_path} ({file_skip_reason})")
 
         if include_debug:
@@ -742,23 +946,52 @@ def _build_snippet(text: str, start: int, end: int, window: int = 80) -> str:
     return snippet
 
 
+def _match_dedupe_key(match: NameMatch) -> tuple[Any, ...]:
+    return (
+        match.searched_name.lower(),
+        match.file_path,
+        match.page_number,
+        match.match_position,
+        match.snippet.lower(),
+        match.match_type,
+    )
+
+
 def _dedupe_matches(matches: Iterable[NameMatch]) -> List[NameMatch]:
     deduped: List[NameMatch] = []
     seen = set()
     for match in matches:
-        key = (
-            match.searched_name.lower(),
-            match.file_path,
-            match.page_number,
-            match.match_position,
-            match.snippet.lower(),
-            match.match_type,
-        )
+        key = _match_dedupe_key(match)
         if key in seen:
             continue
         seen.add(key)
         deduped.append(match)
     return deduped
+
+
+def _find_exact_matches_for_page(
+    page_record: PageRecord,
+    patterns: dict[str, re.Pattern[str]],
+) -> List[NameMatch]:
+    matches: List[NameMatch] = []
+    for name, pattern in patterns.items():
+        for match in pattern.finditer(page_record.text):
+            if page_record.text_source == "ocr_text":
+                match_type = "ocr_text"
+            else:
+                match_type = "exact_text"
+            matches.append(
+                NameMatch(
+                    searched_name=name,
+                    file_name=page_record.file_name,
+                    file_path=page_record.file_path,
+                    page_number=page_record.page_number,
+                    match_position=match.start(),
+                    snippet=_build_snippet(page_record.text, match.start(), match.end()),
+                    match_type=match_type,
+                )
+            )
+    return matches
 
 
 def find_exact_name_matches(page_records: Sequence[PageRecord], names: Sequence[str]) -> List[NameMatch]:
@@ -768,19 +1001,7 @@ def find_exact_name_matches(page_records: Sequence[PageRecord], names: Sequence[
     exact_matches: List[NameMatch] = []
 
     for page_record in page_records:
-        for name, pattern in patterns.items():
-            for match in pattern.finditer(page_record.text):
-                exact_matches.append(
-                    NameMatch(
-                        searched_name=name,
-                        file_name=page_record.file_name,
-                        file_path=page_record.file_path,
-                        page_number=page_record.page_number,
-                        match_position=match.start(),
-                        snippet=_build_snippet(page_record.text, match.start(), match.end()),
-                        match_type="exact",
-                    )
-                )
+        exact_matches.extend(_find_exact_matches_for_page(page_record, patterns))
 
     return _dedupe_matches(exact_matches)
 
@@ -860,6 +1081,289 @@ def find_semantic_matches(
             client.delete_collection(name=collection_name)
         except Exception:  # noqa: BLE001
             pass
+
+
+def run_name_search_progressive(
+    folder_path: str | Path,
+    raw_names: str | Sequence[str],
+    *,
+    start_page: int = 3,
+    enable_ocr_fallback: bool = True,
+    ocr_timeout_per_page: float | None = 20.0,
+    overall_timeout_seconds: float | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> NameSearchOutcome:
+    """Run exact page-by-page name search with progressive updates and fallback OCR."""
+
+    names = parse_names(raw_names)
+    if not names:
+        raise ValueError("Please provide at least one name to search.")
+
+    normalized_start_page = max(1, int(start_page))
+    normalized_ocr_timeout = None if ocr_timeout_per_page is None else float(ocr_timeout_per_page)
+    if normalized_ocr_timeout is not None and normalized_ocr_timeout <= 0:
+        normalized_ocr_timeout = None
+    normalized_overall_timeout = None if overall_timeout_seconds is None else float(overall_timeout_seconds)
+    if normalized_overall_timeout is not None and normalized_overall_timeout <= 0:
+        normalized_overall_timeout = None
+
+    pdf_files = discover_pdf_files(folder_path)
+    patterns = {name: _build_name_pattern(name) for name in names}
+    extractor_order = EXTRACTOR_ORDER
+    start_time = time.perf_counter()
+
+    all_matches: List[NameMatch] = []
+    seen_match_keys: set[tuple[Any, ...]] = set()
+    skipped_files: List[str] = []
+    extraction_debug: List[FileExtractionDebug] = []
+    pages_processed = 0
+    skipped_pages = 0
+    ocr_timeout_pages = 0
+    stop_reason = "completed all files"
+    scan_completed = True
+
+    def elapsed_seconds() -> float:
+        return time.perf_counter() - start_time
+
+    def timed_out() -> bool:
+        return normalized_overall_timeout is not None and elapsed_seconds() >= normalized_overall_timeout
+
+    def emit_progress(
+        *,
+        current_file_index: int,
+        current_file_name: str,
+        current_file_path: str,
+        current_page_number: int,
+        current_file_total_pages: int,
+        stage: str,
+        new_matches: Sequence[NameMatch] | None = None,
+    ) -> None:
+        if not progress_callback:
+            return
+        progress_callback(
+            {
+                "current_file_index": current_file_index,
+                "total_files": len(pdf_files),
+                "current_file_name": current_file_name,
+                "current_file_path": current_file_path,
+                "current_page_number": current_page_number,
+                "current_file_total_pages": current_file_total_pages,
+                "stage": stage,
+                "pages_processed": pages_processed,
+                "total_matches_found": len(all_matches),
+                "skipped_pages": skipped_pages,
+                "skipped_files": len(skipped_files),
+                "ocr_timeout_pages": ocr_timeout_pages,
+                "elapsed_seconds": elapsed_seconds(),
+                "new_matches": list(new_matches or []),
+            }
+        )
+
+    for file_index, pdf_path in enumerate(pdf_files, start=1):
+        if timed_out():
+            scan_completed = False
+            timeout_display = f"{normalized_overall_timeout:.1f}s" if normalized_overall_timeout else "configured"
+            stop_reason = f"stopped by overall timeout ({timeout_display})"
+            break
+
+        extractors, open_debug = _build_pdf_extractors(pdf_path)
+        if not extractors:
+            error_context = "; ".join(
+                debug.error for debug in open_debug.values() if debug.error
+            ) or "unknown error"
+            skip_reason = f"unreadable by all extractors: {error_context}"
+            skipped_files.append(f"{pdf_path} ({skip_reason})")
+            extraction_debug.append(
+                FileExtractionDebug(
+                    file_name=pdf_path.name,
+                    file_path=str(pdf_path),
+                    page_debug=[],
+                    extractor_open_debug=[open_debug[name] for name in extractor_order if name in open_debug],
+                    skipped=True,
+                    skip_reason=skip_reason,
+                )
+            )
+            emit_progress(
+                current_file_index=file_index,
+                current_file_name=pdf_path.name,
+                current_file_path=str(pdf_path),
+                current_page_number=0,
+                current_file_total_pages=0,
+                stage="extracting text",
+            )
+            continue
+
+        max_page_count = max(extractor.page_count for extractor in extractors.values())
+        start_page_index = max(0, normalized_start_page - 1)
+        skipped_pages += min(start_page_index, max_page_count)
+        page_debug_entries: List[PageExtractionDebug] = []
+        file_has_text = False
+        file_stopped_by_timeout = False
+
+        try:
+            for page_index in range(start_page_index, max_page_count):
+                if timed_out():
+                    scan_completed = False
+                    timeout_display = f"{normalized_overall_timeout:.1f}s" if normalized_overall_timeout else "configured"
+                    stop_reason = f"stopped by overall timeout ({timeout_display})"
+                    file_stopped_by_timeout = True
+                    break
+
+                current_page_number = page_index + 1
+                emit_progress(
+                    current_file_index=file_index,
+                    current_file_name=pdf_path.name,
+                    current_file_path=str(pdf_path),
+                    current_page_number=current_page_number,
+                    current_file_total_pages=max_page_count,
+                    stage="extracting text",
+                )
+
+                (
+                    normalized_text,
+                    text_source,
+                    successful_extractor,
+                    winning_raw_text,
+                    attempt_debug,
+                    ocr_attempted,
+                    ocr_succeeded,
+                    ocr_character_count,
+                    ocr_preview,
+                    ocr_error,
+                ) = _extract_page_with_fallback(
+                    pdf_path=pdf_path,
+                    page_index=page_index,
+                    extractor_order=extractor_order,
+                    extractors=extractors,
+                    open_debug=open_debug,
+                    enable_ocr_fallback=enable_ocr_fallback,
+                    ocr_timeout_per_page=normalized_ocr_timeout,
+                )
+
+                if ocr_attempted:
+                    emit_progress(
+                        current_file_index=file_index,
+                        current_file_name=pdf_path.name,
+                        current_file_path=str(pdf_path),
+                        current_page_number=current_page_number,
+                        current_file_total_pages=max_page_count,
+                        stage="OCR fallback",
+                    )
+
+                if ocr_attempted and ocr_error and "timeout" in ocr_error.lower():
+                    ocr_timeout_pages += 1
+
+                extracted = bool(normalized_text)
+                page_debug_entries.append(
+                    PageExtractionDebug(
+                        file_path=str(pdf_path),
+                        page_number=current_page_number,
+                        attempted_extractors=[attempt.extractor_name for attempt in attempt_debug],
+                        successful_extractor=successful_extractor,
+                        character_count=len(normalized_text),
+                        whitespace_only=not extracted,
+                        skipped=not extracted,
+                        preview=_preview_text(normalized_text),
+                        winning_raw_text_first_500=_raw_preview_text(winning_raw_text, max_chars=500),
+                        ocr_attempted=ocr_attempted,
+                        ocr_succeeded=ocr_succeeded,
+                        ocr_character_count=ocr_character_count,
+                        ocr_preview=ocr_preview,
+                        ocr_error=ocr_error,
+                        attempts=attempt_debug,
+                    )
+                )
+
+                if not normalized_text:
+                    pages_processed += 1
+                    skipped_pages += 1
+                    continue
+
+                file_has_text = True
+                page_record = PageRecord(
+                    file_name=pdf_path.name,
+                    file_path=str(pdf_path),
+                    page_number=current_page_number,
+                    text=normalized_text,
+                    text_source=text_source,
+                )
+
+                emit_progress(
+                    current_file_index=file_index,
+                    current_file_name=pdf_path.name,
+                    current_file_path=str(pdf_path),
+                    current_page_number=current_page_number,
+                    current_file_total_pages=max_page_count,
+                    stage="searching matches",
+                )
+
+                new_matches_for_page: List[NameMatch] = []
+                for page_match in _find_exact_matches_for_page(page_record, patterns):
+                    dedupe_key = _match_dedupe_key(page_match)
+                    if dedupe_key in seen_match_keys:
+                        continue
+                    seen_match_keys.add(dedupe_key)
+                    all_matches.append(page_match)
+                    new_matches_for_page.append(page_match)
+
+                pages_processed += 1
+                emit_progress(
+                    current_file_index=file_index,
+                    current_file_name=pdf_path.name,
+                    current_file_path=str(pdf_path),
+                    current_page_number=current_page_number,
+                    current_file_total_pages=max_page_count,
+                    stage="searching matches",
+                    new_matches=new_matches_for_page,
+                )
+        finally:
+            for extractor in extractors.values():
+                extractor.close()
+
+        file_skip_reason: str | None = None
+        if start_page_index >= max_page_count:
+            file_skip_reason = f"no pages at or after start page {normalized_start_page}"
+            skipped_files.append(f"{pdf_path} ({file_skip_reason})")
+        elif not file_has_text:
+            if enable_ocr_fallback:
+                file_skip_reason = (
+                    "no extractable text after PyPDF2, pypdf, pdfplumber, pymupdf, pdftotext, and OCR fallback"
+                )
+            else:
+                file_skip_reason = (
+                    "no extractable text after PyPDF2, pypdf, pdfplumber, pymupdf, and pdftotext (OCR disabled)"
+                )
+            skipped_files.append(f"{pdf_path} ({file_skip_reason})")
+
+        extraction_debug.append(
+            FileExtractionDebug(
+                file_name=pdf_path.name,
+                file_path=str(pdf_path),
+                page_debug=page_debug_entries,
+                extractor_open_debug=[open_debug[name] for name in extractor_order if name in open_debug],
+                skipped=not file_has_text,
+                skip_reason=file_skip_reason,
+            )
+        )
+
+        if file_stopped_by_timeout:
+            break
+
+    return NameSearchOutcome(
+        folder_path=str(Path(folder_path).expanduser().resolve()),
+        names=names,
+        pdf_files=[str(path) for path in pdf_files],
+        skipped_files=skipped_files,
+        results=all_matches,
+        extraction_debug=extraction_debug,
+        scan_completed=scan_completed,
+        stop_reason=stop_reason,
+        pages_processed=pages_processed,
+        skipped_pages=skipped_pages,
+        skipped_files_count=len(skipped_files),
+        ocr_timeout_pages=ocr_timeout_pages,
+        elapsed_seconds=elapsed_seconds(),
+    )
 
 
 def run_name_search(
