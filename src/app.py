@@ -16,11 +16,23 @@ import docx
 import io
 import os
 import logging
-from typing import List, Tuple, Optional
+import re
+from typing import List, Tuple, Optional, Any
 from name_finder import (
     collect_pdf_pages,
+    discover_pdf_files,
     run_name_search_progressive,
     summarize_extraction_debug,
+)
+from name_search_storage import (
+    get_folder_storage_summary,
+    open_storage_connection,
+    parse_voter_records_from_page,
+    replace_page_records,
+    search_stored_records,
+    update_document_status,
+    upsert_document,
+    upsert_page,
 )
 from ollama_rag import (
     create_ollama_collection,
@@ -120,6 +132,20 @@ if 'name_search_partial_results' not in st.session_state:
     st.session_state.name_search_partial_results = []
 if 'name_search_last_stop_reason' not in st.session_state:
     st.session_state.name_search_last_stop_reason = None
+if 'name_search_mode' not in st.session_state:
+    st.session_state.name_search_mode = "Live Scan Search"
+if 'name_search_stop_requested' not in st.session_state:
+    st.session_state.name_search_stop_requested = False
+if 'name_search_db_path' not in st.session_state:
+    st.session_state.name_search_db_path = os.environ.get("DATABASE_URL", "")
+if 'name_search_stored_results' not in st.session_state:
+    st.session_state.name_search_stored_results = []
+if 'name_search_partial_structured_results' not in st.session_state:
+    st.session_state.name_search_partial_structured_results = []
+if 'name_search_storage_summary' not in st.session_state:
+    st.session_state.name_search_storage_summary = None
+if 'name_search_last_action' not in st.session_state:
+    st.session_state.name_search_last_action = None
 if 'ollama_collection' not in st.session_state:
     st.session_state.ollama_collection = None
 if 'ollama_documents_processed' not in st.session_state:
@@ -595,13 +621,107 @@ def show_landing_page():
     st.markdown("---")
     st.markdown("### 📤 Or Upload Your Own Documents in the Sidebar")
 
+
+def _highlight_name_text(value: str, name_query: str) -> str:
+    if not value:
+        return ""
+    query = (name_query or "").strip()
+    if not query:
+        return value
+    pattern = re.compile(re.escape(query), flags=re.IGNORECASE)
+    return pattern.sub(lambda match: f"**{match.group(0)}**", value)
+
+
+def _record_matches_name_query(record: dict[str, Any], name_query: str) -> bool:
+    normalized_query = (name_query or "").strip().lower()
+    if not normalized_query:
+        return False
+    name_value = str(record.get("name") or "").lower()
+    raw_value = str(record.get("raw_record_text") or "").lower()
+    return normalized_query in name_value or normalized_query in raw_value
+
+
+def _render_structured_records(records: List[dict[str, Any]], searched_name: str, title: str) -> None:
+    st.markdown(f"### {title}")
+    if not records:
+        st.info("No structured records found.")
+        return
+
+    rows = []
+    for record in records:
+        rows.append(
+            {
+                "name": record.get("name") or "",
+                "elector_id": record.get("elector_id") or "",
+                "serial_number": record.get("serial_number") or "",
+                "relative_name": record.get("relative_name") or "",
+                "relative_type": record.get("relative_type") or "",
+                "house_number": record.get("house_number") or "",
+                "age": record.get("age"),
+                "gender": record.get("gender") or "",
+                "constituency": record.get("constituency") or "",
+                "section_name": record.get("section_name") or "",
+                "file_name": record.get("file_name") or "",
+                "file_path": record.get("file_path") or "",
+                "page_number": record.get("page_number") or 0,
+                "match_type": record.get("extraction_method") or "",
+            }
+        )
+
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    capped_records = records[:200]
+    if len(records) > len(capped_records):
+        st.caption(f"Showing detailed cards for first {len(capped_records)} of {len(records)} records.")
+
+    for index, record in enumerate(capped_records, start=1):
+        name_value = str(record.get("name") or "")
+        highlighted_name = _highlight_name_text(name_value, searched_name)
+        header_name = name_value if name_value else "Unnamed record"
+        file_name = str(record.get("file_name") or "")
+        page_number = int(record.get("page_number") or 0)
+        match_type = str(record.get("extraction_method") or "")
+        with st.expander(f"{index}. {header_name} | {file_name} | page {page_number} | {match_type}"):
+            if highlighted_name:
+                st.markdown(f"**Name:** {highlighted_name}")
+            else:
+                st.markdown("**Name:** (not parsed)")
+
+            st.markdown(
+                "\n".join(
+                    [
+                        f"- Elector ID: `{record.get('elector_id') or ''}`",
+                        f"- Serial Number: `{record.get('serial_number') or ''}`",
+                        f"- Relative: `{record.get('relative_name') or ''}` ({record.get('relative_type') or 'unknown'})",
+                        f"- House Number: `{record.get('house_number') or ''}`",
+                        f"- Age / Gender: `{record.get('age') or ''}` / `{record.get('gender') or ''}`",
+                        f"- Constituency: `{record.get('constituency') or ''}`",
+                        f"- Section: `{record.get('section_name') or ''}`",
+                        f"- File: `{record.get('file_name') or ''}`",
+                        f"- Path: `{record.get('file_path') or ''}`",
+                        f"- Page: `{record.get('page_number') or ''}`",
+                        f"- Match Type: `{record.get('extraction_method') or ''}`",
+                    ]
+                )
+            )
+            with st.expander("Raw OCR/Text block"):
+                st.code(str(record.get("raw_record_text") or ""), language="text")
+
+
 def show_name_search_workflow():
     """Render folder-based PDF name verification workflow."""
 
     st.markdown('<div class="main-header">🔎 PDF Name Search</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="sub-header">Recursively scan local PDFs and verify an exact name page-by-page.</div>',
+        '<div class="sub-header">Live scan PDFs, parse structured OCR records, and search stored local data.</div>',
         unsafe_allow_html=True,
+    )
+
+    mode = st.radio(
+        "Mode",
+        ["Live Scan Search", "Search Stored Data"],
+        horizontal=True,
+        key="name_search_mode",
     )
 
     folder_path = st.text_input(
@@ -610,12 +730,128 @@ def show_name_search_workflow():
         placeholder="/Users/aritra/Documents/pdfs",
         help="Local folder path to scan recursively for PDF files",
     )
+    db_path = st.text_input(
+        "PostgreSQL DATABASE_URL (optional override)",
+        value=st.session_state.get("name_search_db_path", os.environ.get("DATABASE_URL", "")),
+        help="If empty, DATABASE_URL / PG* environment variables are used",
+    )
     name_input = st.text_input(
         "Name to Search",
         value=st.session_state.get("name_search_name", ""),
         placeholder="John Smith",
         help="Exact name to search for (case-insensitive)",
     )
+
+    def _format_match_block(match) -> str:
+        return (
+            f"Name: {match.searched_name}\n"
+            f"File: {match.file_name}\n"
+            f"Path: {match.file_path}\n"
+            f"Page: {match.page_number}\n"
+            f"Position: {match.match_position}\n"
+            f"Match Type: {match.match_type}\n"
+            f'Snippet: "{match.snippet}"\n'
+            "--------------------------------------------------"
+        )
+
+    def _query_folder_status_counts(connection, resolved_folder: str) -> dict[str, dict[str, int]]:
+        document_rows = connection.execute(
+            """
+            SELECT status, COUNT(*) AS c
+            FROM documents
+            WHERE folder_path = %s
+            GROUP BY status
+            ORDER BY status
+            """,
+            (resolved_folder,),
+        ).fetchall()
+        page_rows = connection.execute(
+            """
+            SELECT p.status AS status, COUNT(*) AS c
+            FROM pages p
+            JOIN documents d ON d.id = p.document_id
+            WHERE d.folder_path = %s
+            GROUP BY p.status
+            ORDER BY p.status
+            """,
+            (resolved_folder,),
+        ).fetchall()
+        return {
+            "documents": {str(row["status"]): int(row["c"]) for row in document_rows},
+            "pages": {str(row["status"]): int(row["c"]) for row in page_rows},
+        }
+
+    resolved_folder_path = str(Path(folder_path).expanduser().resolve()) if folder_path.strip() else ""
+
+    if mode == "Search Stored Data":
+        if st.button("Search Stored Data", type="primary"):
+            st.session_state.name_search_folder_path = folder_path
+            st.session_state.name_search_name = name_input
+            st.session_state.name_search_db_path = db_path
+
+            if not folder_path.strip():
+                st.warning("Please provide a folder path.")
+            elif not name_input.strip():
+                st.warning("Please provide a name to search.")
+            else:
+                try:
+                    connection = open_storage_connection(db_path.strip() or None)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Failed to open storage DB: {exc}")
+                    st.session_state.name_search_stored_results = []
+                    st.session_state.name_search_storage_summary = None
+                else:
+                    try:
+                        summary = get_folder_storage_summary(connection, resolved_folder_path)
+                        status_counts = _query_folder_status_counts(connection, resolved_folder_path)
+                        records = search_stored_records(
+                            connection,
+                            folder_path=resolved_folder_path,
+                            name_query=name_input,
+                            limit=1000,
+                        )
+                    finally:
+                        connection.close()
+
+                    st.session_state.name_search_stored_results = records
+                    st.session_state.name_search_storage_summary = {
+                        "counts": summary,
+                        "status": status_counts,
+                    }
+
+        storage_summary_payload = st.session_state.get("name_search_storage_summary")
+        if storage_summary_payload:
+            counts = storage_summary_payload.get("counts", {})
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Stored Documents", int(counts.get("documents", 0)))
+            col2.metric("Stored Pages", int(counts.get("pages", 0)))
+            col3.metric("Stored Parsed Records", int(counts.get("records", 0)))
+
+            status_payload = storage_summary_payload.get("status", {})
+            document_status = status_payload.get("documents", {})
+            page_status = status_payload.get("pages", {})
+            if document_status:
+                st.caption(
+                    "Document status: "
+                    + ", ".join(f"{status}={count}" for status, count in document_status.items())
+                )
+            if page_status:
+                st.caption(
+                    "Page status: "
+                    + ", ".join(f"{status}={count}" for status, count in page_status.items())
+                )
+
+        stored_records = st.session_state.get("name_search_stored_results", [])
+        if name_input.strip():
+            _render_structured_records(
+                stored_records,
+                searched_name=name_input.strip(),
+                title="Structured Stored Records",
+            )
+        else:
+            st.info("Provide a name and click `Search Stored Data`.")
+        return
+
     start_page = st.number_input(
         "Start page",
         min_value=1,
@@ -649,35 +885,50 @@ def show_name_search_workflow():
         help="Show file/page-level extractor attempts to debug text extraction issues",
     )
 
+    action_col1, action_col2, action_col3 = st.columns(3)
+    search_clicked = action_col1.button("Search PDFs", type="primary")
+    process_store_clicked = action_col2.button("Process & Store")
+    stop_clicked = action_col3.button("Stop Scan")
+
+    if stop_clicked:
+        st.session_state.name_search_stop_requested = True
+        st.session_state.name_search_last_stop_reason = "stopped by user"
+        if st.session_state.get("name_search_scan_in_progress", False):
+            st.warning("Stop requested. Attempting to stop the current scan and preserve partial results.")
+        else:
+            st.info("No scan is currently running.")
+        st.rerun()
+
     if st.session_state.get("name_search_scan_in_progress", False):
-        st.warning("The previous scan appears interrupted by rerun/user action. Showing saved partial results.")
+        if st.session_state.get("name_search_stop_requested", False):
+            st.warning("The previous scan was stopped by user. Showing saved partial results.")
+            st.session_state.name_search_last_stop_reason = "stopped by user"
+        else:
+            st.warning("The previous scan appears interrupted by rerun/user action. Showing saved partial results.")
+            st.session_state.name_search_last_stop_reason = "interrupted by rerun/user action"
         st.session_state.name_search_scan_in_progress = False
-        st.session_state.name_search_last_stop_reason = "interrupted by rerun/user action"
+        st.session_state.name_search_stop_requested = False
 
-    def _format_match_block(match) -> str:
-        return (
-            f"Name: {match.searched_name}\n"
-            f"File: {match.file_name}\n"
-            f"Path: {match.file_path}\n"
-            f"Page: {match.page_number}\n"
-            f"Position: {match.match_position}\n"
-            f"Match Type: {match.match_type}\n"
-            f'Snippet: "{match.snippet}"\n'
-            "--------------------------------------------------"
-        )
+    action_mode = None
+    if search_clicked:
+        action_mode = "search"
+    elif process_store_clicked:
+        action_mode = "process_store"
 
-    if st.button("Search PDFs", type="primary"):
+    if action_mode:
         st.session_state.name_search_folder_path = folder_path
         st.session_state.name_search_name = name_input
+        st.session_state.name_search_db_path = db_path
         st.session_state.name_search_start_page = int(start_page)
         st.session_state.name_search_enable_ocr_fallback = bool(enable_ocr_fallback)
         st.session_state.name_search_ocr_timeout_seconds = int(ocr_timeout_seconds)
         st.session_state.name_search_overall_timeout_seconds = int(overall_timeout_seconds)
+        st.session_state.name_search_last_action = action_mode
 
         if not folder_path.strip():
             st.session_state.name_search_outcome = None
             st.warning("Please provide a folder path.")
-        elif not name_input.strip():
+        elif action_mode == "search" and not name_input.strip():
             st.session_state.name_search_outcome = None
             st.warning("Please provide a name to search.")
         else:
@@ -686,16 +937,48 @@ def show_name_search_workflow():
                 st.session_state.name_search_outcome = None
                 st.error(f"Folder path does not exist or is not a directory: {resolved_folder}")
             else:
+                storage_connection = None
                 try:
                     st.session_state.name_search_outcome = None
                     st.session_state.name_search_partial_results = []
+                    st.session_state.name_search_partial_structured_results = []
+                    st.session_state.name_search_stored_results = []
+                    st.session_state.name_search_storage_summary = None
                     st.session_state.name_search_scan_in_progress = True
                     st.session_state.name_search_last_stop_reason = "running"
+                    st.session_state.name_search_stop_requested = False
 
                     live_status_placeholder = st.empty()
                     live_metrics_placeholder = st.empty()
                     live_progress_bar = st.progress(0.0)
                     partial_results_container = st.container()
+                    partial_structured_container = st.container()
+
+                    try:
+                        storage_connection = open_storage_connection(db_path.strip() or None)
+                    except Exception as exc:  # noqa: BLE001
+                        st.warning(f"Storage disabled for this run (DB open failed): {exc}")
+                        storage_connection = None
+
+                    resolved_scan_folder = str(resolved_folder.resolve())
+                    if storage_connection is not None:
+                        try:
+                            discovered_for_pending = discover_pdf_files(resolved_scan_folder)
+                            for pending_pdf_path in discovered_for_pending:
+                                upsert_document(
+                                    storage_connection,
+                                    folder_path=resolved_scan_folder,
+                                    file_name=pending_pdf_path.name,
+                                    file_path=str(pending_pdf_path),
+                                    pages_total=0,
+                                    status="pending",
+                                    error_message=None,
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            st.warning(f"Failed to pre-mark pending documents in storage: {exc}")
+
+                    document_state: dict[str, dict[str, int]] = {}
+                    structured_seen_keys: set[tuple[Any, ...]] = set()
 
                     def _on_progress(update: dict):
                         total_files = int(update.get("total_files", 0))
@@ -749,48 +1032,283 @@ def show_name_search_workflow():
                             for match in new_matches:
                                 partial_results_container.code(_format_match_block(match), language="text")
 
-                    with st.spinner("Scanning all PDFs progressively..."):
+                        partial_structured_records = st.session_state.get("name_search_partial_structured_results", [])
+                        if partial_structured_records:
+                            partial_structured_container.markdown("### Partial Structured Records (Live)")
+                            partial_structured_container.dataframe(
+                                [
+                                    {
+                                        "name": record.get("name") or "",
+                                        "elector_id": record.get("elector_id") or "",
+                                        "file_name": record.get("file_name") or "",
+                                        "page_number": record.get("page_number") or 0,
+                                        "match_type": record.get("extraction_method") or "",
+                                    }
+                                    for record in partial_structured_records
+                                ],
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                    def _on_lifecycle(event: dict[str, Any]) -> None:
+                        if storage_connection is None:
+                            return
+
+                        event_type = str(event.get("event") or "")
+                        file_path_value = str(event.get("file_path") or "")
+                        file_name_value = str(event.get("file_name") or "")
+                        total_pages_value = int(event.get("total_pages") or 0)
+
+                        if event_type == "file_started":
+                            document_id = upsert_document(
+                                storage_connection,
+                                folder_path=resolved_scan_folder,
+                                file_name=file_name_value,
+                                file_path=file_path_value,
+                                pages_total=total_pages_value,
+                                status="processing",
+                                error_message=None,
+                            )
+                            document_state[file_path_value] = {
+                                "document_id": int(document_id),
+                                "pages_processed": 0,
+                                "pages_total": total_pages_value,
+                            }
+                            return
+
+                        if event_type == "page_finished":
+                            page_number_value = int(event.get("page_number") or 0)
+                            if page_number_value <= 0:
+                                return
+
+                            state = document_state.get(file_path_value)
+                            if state is None:
+                                document_id = upsert_document(
+                                    storage_connection,
+                                    folder_path=resolved_scan_folder,
+                                    file_name=file_name_value,
+                                    file_path=file_path_value,
+                                    pages_total=total_pages_value,
+                                    status="processing",
+                                    error_message=None,
+                                )
+                                state = {"document_id": int(document_id), "pages_processed": 0, "pages_total": total_pages_value}
+                                document_state[file_path_value] = state
+
+                            document_id = int(state["document_id"])
+                            page_status = str(event.get("status") or "processed")
+                            extraction_method = str(event.get("extraction_method") or "")
+                            raw_text_value = str(event.get("raw_text") or "")
+                            normalized_text_value = str(event.get("text") or "")
+                            text_for_storage = raw_text_value if raw_text_value.strip() else normalized_text_value
+                            error_message = str(event.get("error_message") or "")
+
+                            parsed_records: list[dict[str, Any]] = []
+                            if text_for_storage.strip():
+                                parsed_records = parse_voter_records_from_page(
+                                    page_text=text_for_storage,
+                                    file_name=file_name_value,
+                                    file_path=file_path_value,
+                                    page_number=page_number_value,
+                                    extraction_method=extraction_method or "exact_text",
+                                )
+
+                            page_id = upsert_page(
+                                storage_connection,
+                                document_id=document_id,
+                                page_number=page_number_value,
+                                status=page_status,
+                                extraction_method=extraction_method or None,
+                                raw_text=text_for_storage,
+                                parsed_record_count=len(parsed_records),
+                                error_message=error_message or None,
+                            )
+                            replace_page_records(
+                                storage_connection,
+                                document_id=document_id,
+                                page_id=page_id,
+                                records=parsed_records,
+                            )
+
+                            state["pages_processed"] = int(state.get("pages_processed", 0)) + 1
+                            update_document_status(
+                                storage_connection,
+                                document_id=document_id,
+                                status="processing",
+                                pages_processed=int(state["pages_processed"]),
+                                error_message=None,
+                            )
+
+                            searched_name_value = name_input.strip()
+                            if searched_name_value:
+                                for parsed_record in parsed_records:
+                                    if not _record_matches_name_query(parsed_record, searched_name_value):
+                                        continue
+                                    dedupe_key = (
+                                        parsed_record.get("file_path"),
+                                        parsed_record.get("page_number"),
+                                        parsed_record.get("serial_number"),
+                                        parsed_record.get("elector_id"),
+                                        parsed_record.get("name"),
+                                        parsed_record.get("raw_record_text"),
+                                    )
+                                    if dedupe_key in structured_seen_keys:
+                                        continue
+                                    structured_seen_keys.add(dedupe_key)
+                                    st.session_state.name_search_partial_structured_results.append(parsed_record)
+                            return
+
+                        if event_type == "page_started":
+                            page_number_value = int(event.get("page_number") or 0)
+                            if page_number_value <= 0:
+                                return
+
+                            state = document_state.get(file_path_value)
+                            if state is None:
+                                document_id = upsert_document(
+                                    storage_connection,
+                                    folder_path=resolved_scan_folder,
+                                    file_name=file_name_value,
+                                    file_path=file_path_value,
+                                    pages_total=total_pages_value,
+                                    status="processing",
+                                    error_message=None,
+                                )
+                                state = {"document_id": int(document_id), "pages_processed": 0, "pages_total": total_pages_value}
+                                document_state[file_path_value] = state
+
+                            upsert_page(
+                                storage_connection,
+                                document_id=int(state["document_id"]),
+                                page_number=page_number_value,
+                                status="processing",
+                                extraction_method=None,
+                                raw_text="",
+                                parsed_record_count=0,
+                                error_message=None,
+                            )
+                            return
+
+                        if event_type == "file_finished":
+                            state = document_state.get(file_path_value)
+                            if state is None:
+                                document_id = upsert_document(
+                                    storage_connection,
+                                    folder_path=resolved_scan_folder,
+                                    file_name=file_name_value,
+                                    file_path=file_path_value,
+                                    pages_total=total_pages_value,
+                                    status="processing",
+                                    error_message=None,
+                                )
+                                state = {"document_id": int(document_id), "pages_processed": 0, "pages_total": total_pages_value}
+                                document_state[file_path_value] = state
+
+                            update_document_status(
+                                storage_connection,
+                                document_id=int(state["document_id"]),
+                                status=str(event.get("status") or "processed"),
+                                pages_processed=int(event.get("pages_processed") or state.get("pages_processed", 0)),
+                                error_message=str(event.get("error_message") or "") or None,
+                            )
+                            return
+
+                    query_for_run = name_input.strip()
+                    if action_mode == "process_store" and not query_for_run:
+                        query_for_run = "__process_and_store_only__"
+
+                    spinner_text = (
+                        "Processing PDFs and storing parsed records..."
+                        if action_mode == "process_store"
+                        else "Scanning all PDFs progressively..."
+                    )
+                    with st.spinner(spinner_text):
                         outcome = run_name_search_progressive(
                             folder_path=folder_path,
-                            raw_names=name_input,
+                            raw_names=query_for_run,
                             start_page=int(start_page),
                             enable_ocr_fallback=bool(enable_ocr_fallback),
                             ocr_timeout_per_page=float(ocr_timeout_seconds) if enable_ocr_fallback else None,
                             overall_timeout_seconds=float(overall_timeout_seconds) if overall_timeout_seconds > 0 else None,
                             progress_callback=_on_progress,
+                            lifecycle_callback=_on_lifecycle,
+                            stop_check=lambda: bool(st.session_state.get("name_search_stop_requested", False)),
                         )
                 except ValueError as exc:
                     st.session_state.name_search_outcome = None
                     st.error(str(exc))
                 except BaseException as exc:  # noqa: BLE001
                     if exc.__class__.__name__ in {"RerunException", "StopException"}:
-                        st.session_state.name_search_last_stop_reason = "interrupted by rerun/user action"
+                        if st.session_state.get("name_search_stop_requested", False):
+                            st.session_state.name_search_last_stop_reason = "stopped by user"
+                        else:
+                            st.session_state.name_search_last_stop_reason = "interrupted by rerun/user action"
                     raise
                 else:
                     st.session_state.name_search_outcome = outcome
                     st.session_state.name_search_partial_results = list(outcome.results)
                     st.session_state.name_search_last_stop_reason = outcome.stop_reason
+
+                    if storage_connection is not None:
+                        try:
+                            summary = get_folder_storage_summary(storage_connection, resolved_scan_folder)
+                            status_counts = _query_folder_status_counts(storage_connection, resolved_scan_folder)
+                            st.session_state.name_search_storage_summary = {
+                                "counts": summary,
+                                "status": status_counts,
+                            }
+                            if name_input.strip():
+                                st.session_state.name_search_stored_results = search_stored_records(
+                                    storage_connection,
+                                    folder_path=resolved_scan_folder,
+                                    name_query=name_input.strip(),
+                                    limit=1000,
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            st.warning(f"Scan completed but failed to load stored records summary: {exc}")
+
                     if outcome.scan_completed:
-                        st.success(
-                            f"Scan complete. PDFs discovered: {len(outcome.pdf_files)} | stop reason: {outcome.stop_reason}"
-                        )
+                        if action_mode == "process_store":
+                            st.success(
+                                f"Processing complete. PDFs discovered: {len(outcome.pdf_files)} | stop reason: {outcome.stop_reason}"
+                            )
+                        else:
+                            st.success(
+                                f"Scan complete. PDFs discovered: {len(outcome.pdf_files)} | stop reason: {outcome.stop_reason}"
+                            )
                     else:
+                        stop_reason_value = outcome.stop_reason
+                        if st.session_state.get("name_search_stop_requested", False):
+                            stop_reason_value = "stopped by user"
                         st.warning(
-                            f"Scan stopped early. PDFs discovered: {len(outcome.pdf_files)} | stop reason: {outcome.stop_reason}"
+                            f"Run stopped early. PDFs discovered: {len(outcome.pdf_files)} | stop reason: {stop_reason_value}"
                         )
                 finally:
                     st.session_state.name_search_scan_in_progress = False
+                    st.session_state.name_search_stop_requested = False
+                    if storage_connection is not None:
+                        try:
+                            storage_connection.close()
+                        except Exception:  # noqa: BLE001
+                            pass
 
     outcome = st.session_state.get("name_search_outcome")
     if not outcome:
         partial_results = st.session_state.get("name_search_partial_results", [])
+        partial_structured = st.session_state.get("name_search_partial_structured_results", [])
         last_stop_reason = st.session_state.get("name_search_last_stop_reason")
-        if partial_results and last_stop_reason == "interrupted by rerun/user action":
-            st.warning("Last run was interrupted by rerun/user action. Showing preserved partial results.")
+        if partial_results and last_stop_reason in {"interrupted by rerun/user action", "stopped by user"}:
+            st.warning(f"Last run stopped early ({last_stop_reason}). Showing preserved partial results.")
             for match in partial_results:
                 st.code(_format_match_block(match), language="text")
+            if partial_structured:
+                _render_structured_records(
+                    partial_structured,
+                    searched_name=name_input.strip(),
+                    title="Structured Partial Records",
+                )
             return
-        st.info("Enter a folder path and a name, then click 'Search PDFs'.")
+        st.info("Enter a folder path and a name, then click `Search PDFs` or `Process & Store`.")
         return
 
     st.subheader("Results")
@@ -827,15 +1345,52 @@ def show_name_search_workflow():
             for skipped in outcome.skipped_files:
                 st.write(f"- {skipped}")
 
-    searched_name = outcome.names[0] if outcome.names else name_input.strip()
+    input_name_value = name_input.strip()
+    last_action = st.session_state.get("name_search_last_action")
+    if last_action == "process_store" and not input_name_value:
+        searched_name = ""
+    else:
+        searched_name = outcome.names[0] if outcome.names else input_name_value
     deterministic_matches = [
         match for match in outcome.results if match.match_type in {"exact_text", "ocr_text", "exact"}
     ]
-    if not deterministic_matches:
+    if not searched_name and not deterministic_matches:
+        st.info("Processing completed without a live name query. Use `Search Stored Data` for fast lookups.")
+    elif not deterministic_matches:
         st.info(f'No matches found for "{searched_name}"')
     else:
+        st.markdown("### Exact/Deterministic Match Results")
         for match in deterministic_matches:
             st.code(_format_match_block(match), language="text")
+
+    storage_summary_payload = st.session_state.get("name_search_storage_summary")
+    if storage_summary_payload:
+        counts = storage_summary_payload.get("counts", {})
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Stored Documents", int(counts.get("documents", 0)))
+        col2.metric("Stored Pages", int(counts.get("pages", 0)))
+        col3.metric("Stored Parsed Records", int(counts.get("records", 0)))
+        status_payload = storage_summary_payload.get("status", {})
+        document_status = status_payload.get("documents", {})
+        page_status = status_payload.get("pages", {})
+        if document_status:
+            st.caption(
+                "Document status: "
+                + ", ".join(f"{status}={count}" for status, count in document_status.items())
+            )
+        if page_status:
+            st.caption(
+                "Page status: "
+                + ", ".join(f"{status}={count}" for status, count in page_status.items())
+            )
+
+    stored_structured_records = st.session_state.get("name_search_stored_results", [])
+    if searched_name and stored_structured_records:
+        _render_structured_records(
+            stored_structured_records,
+            searched_name=searched_name,
+            title="Structured Parsed Records",
+        )
 
     if st.session_state.get("name_search_show_debug", False):
         debug_entries = outcome.extraction_debug

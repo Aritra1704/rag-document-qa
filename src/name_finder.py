@@ -728,11 +728,14 @@ def _extract_page_with_fallback(
 
     if not normalized_text and enable_ocr_fallback:
         ocr_attempted = True
-        ocr_raw_text, ocr_extract_error = _extract_page_text_with_ocr(
-            pdf_path,
-            page_index,
-            timeout_seconds=ocr_timeout_per_page,
-        )
+        if ocr_timeout_per_page is None:
+            ocr_raw_text, ocr_extract_error = _extract_page_text_with_ocr(pdf_path, page_index)
+        else:
+            ocr_raw_text, ocr_extract_error = _extract_page_text_with_ocr(
+                pdf_path,
+                page_index,
+                timeout_seconds=ocr_timeout_per_page,
+            )
         ocr_raw_text = ocr_raw_text or ""
         ocr_character_count = len(ocr_raw_text)
         ocr_preview = _raw_preview_text(ocr_raw_text, max_chars=150)
@@ -1092,6 +1095,8 @@ def run_name_search_progressive(
     ocr_timeout_per_page: float | None = 20.0,
     overall_timeout_seconds: float | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    lifecycle_callback: Callable[[dict[str, Any]], None] | None = None,
+    stop_check: Callable[[], bool] | None = None,
 ) -> NameSearchOutcome:
     """Run exact page-by-page name search with progressive updates and fallback OCR."""
 
@@ -1107,6 +1112,7 @@ def run_name_search_progressive(
     if normalized_overall_timeout is not None and normalized_overall_timeout <= 0:
         normalized_overall_timeout = None
 
+    resolved_folder_path = str(Path(folder_path).expanduser().resolve())
     pdf_files = discover_pdf_files(folder_path)
     patterns = {name: _build_name_pattern(name) for name in names}
     extractor_order = EXTRACTOR_ORDER
@@ -1127,6 +1133,22 @@ def run_name_search_progressive(
 
     def timed_out() -> bool:
         return normalized_overall_timeout is not None and elapsed_seconds() >= normalized_overall_timeout
+
+    def stop_requested() -> bool:
+        if not stop_check:
+            return False
+        try:
+            return bool(stop_check())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def compute_stop_reason() -> str | None:
+        if stop_requested():
+            return "stopped by user"
+        if timed_out():
+            timeout_display = f"{normalized_overall_timeout:.1f}s" if normalized_overall_timeout else "configured"
+            return f"stopped by overall timeout ({timeout_display})"
+        return None
 
     def emit_progress(
         *,
@@ -1159,11 +1181,19 @@ def run_name_search_progressive(
             }
         )
 
+    def emit_lifecycle(payload: dict[str, Any]) -> None:
+        if not lifecycle_callback:
+            return
+        try:
+            lifecycle_callback(payload)
+        except Exception:  # noqa: BLE001
+            pass
+
     for file_index, pdf_path in enumerate(pdf_files, start=1):
-        if timed_out():
+        current_stop_reason = compute_stop_reason()
+        if current_stop_reason:
             scan_completed = False
-            timeout_display = f"{normalized_overall_timeout:.1f}s" if normalized_overall_timeout else "configured"
-            stop_reason = f"stopped by overall timeout ({timeout_display})"
+            stop_reason = current_stop_reason
             break
 
         extractors, open_debug = _build_pdf_extractors(pdf_path)
@@ -1183,6 +1213,21 @@ def run_name_search_progressive(
                     skip_reason=skip_reason,
                 )
             )
+            emit_lifecycle(
+                {
+                    "event": "file_finished",
+                    "folder_path": resolved_folder_path,
+                    "current_file_index": file_index,
+                    "total_files": len(pdf_files),
+                    "file_name": pdf_path.name,
+                    "file_path": str(pdf_path),
+                    "total_pages": 0,
+                    "pages_processed": 0,
+                    "status": "failed",
+                    "error_message": skip_reason,
+                    "skip_reason": skip_reason,
+                }
+            )
             emit_progress(
                 current_file_index=file_index,
                 current_file_name=pdf_path.name,
@@ -1198,18 +1243,46 @@ def run_name_search_progressive(
         skipped_pages += min(start_page_index, max_page_count)
         page_debug_entries: List[PageExtractionDebug] = []
         file_has_text = False
-        file_stopped_by_timeout = False
+        file_stop_reason: str | None = None
+        file_pages_processed = 0
+
+        emit_lifecycle(
+            {
+                "event": "file_started",
+                "folder_path": resolved_folder_path,
+                "current_file_index": file_index,
+                "total_files": len(pdf_files),
+                "file_name": pdf_path.name,
+                "file_path": str(pdf_path),
+                "total_pages": max_page_count,
+                "start_page": normalized_start_page,
+                "status": "processing",
+            }
+        )
 
         try:
             for page_index in range(start_page_index, max_page_count):
-                if timed_out():
+                current_stop_reason = compute_stop_reason()
+                if current_stop_reason:
                     scan_completed = False
-                    timeout_display = f"{normalized_overall_timeout:.1f}s" if normalized_overall_timeout else "configured"
-                    stop_reason = f"stopped by overall timeout ({timeout_display})"
-                    file_stopped_by_timeout = True
+                    stop_reason = current_stop_reason
+                    file_stop_reason = current_stop_reason
                     break
 
                 current_page_number = page_index + 1
+                emit_lifecycle(
+                    {
+                        "event": "page_started",
+                        "folder_path": resolved_folder_path,
+                        "current_file_index": file_index,
+                        "total_files": len(pdf_files),
+                        "file_name": pdf_path.name,
+                        "file_path": str(pdf_path),
+                        "page_number": current_page_number,
+                        "total_pages": max_page_count,
+                        "status": "processing",
+                    }
+                )
                 emit_progress(
                     current_file_index=file_index,
                     current_file_name=pdf_path.name,
@@ -1254,6 +1327,36 @@ def run_name_search_progressive(
                     ocr_timeout_pages += 1
 
                 extracted = bool(normalized_text)
+                attempt_errors = [
+                    attempt.error
+                    for attempt in attempt_debug
+                    if attempt.error and not str(attempt.error).startswith("skipped after winner:")
+                ]
+                page_error_message = ""
+                if not extracted:
+                    if ocr_error:
+                        page_error_message = ocr_error
+                    elif attempt_errors:
+                        page_error_message = "; ".join(dict.fromkeys(str(error) for error in attempt_errors))
+                    else:
+                        page_error_message = "empty/whitespace text"
+
+                has_real_error = any(
+                    error and str(error).strip().lower() != "empty/whitespace text"
+                    for error in attempt_errors
+                )
+                if ocr_error and str(ocr_error).strip().lower() not in {"", "empty/whitespace ocr text"}:
+                    has_real_error = True
+
+                page_status = "processed"
+                if not extracted:
+                    if page_error_message and "timeout" in page_error_message.lower():
+                        page_status = "skipped"
+                    elif has_real_error:
+                        page_status = "failed"
+                    else:
+                        page_status = "skipped"
+
                 page_debug_entries.append(
                     PageExtractionDebug(
                         file_path=str(pdf_path),
@@ -1273,6 +1376,29 @@ def run_name_search_progressive(
                         attempts=attempt_debug,
                     )
                 )
+                emit_lifecycle(
+                    {
+                        "event": "page_finished",
+                        "folder_path": resolved_folder_path,
+                        "current_file_index": file_index,
+                        "total_files": len(pdf_files),
+                        "file_name": pdf_path.name,
+                        "file_path": str(pdf_path),
+                        "page_number": current_page_number,
+                        "total_pages": max_page_count,
+                        "status": page_status,
+                        "extracted": extracted,
+                        "extraction_method": text_source if extracted else "",
+                        "successful_extractor": successful_extractor or "",
+                        "text": normalized_text,
+                        "raw_text": winning_raw_text,
+                        "error_message": page_error_message,
+                        "ocr_attempted": ocr_attempted,
+                        "ocr_succeeded": ocr_succeeded,
+                        "ocr_error": ocr_error or "",
+                    }
+                )
+                file_pages_processed += 1
 
                 if not normalized_text:
                     pages_processed += 1
@@ -1321,9 +1447,13 @@ def run_name_search_progressive(
                 extractor.close()
 
         file_skip_reason: str | None = None
+        file_status = "processed"
+        file_status_message: str | None = None
         if start_page_index >= max_page_count:
             file_skip_reason = f"no pages at or after start page {normalized_start_page}"
             skipped_files.append(f"{pdf_path} ({file_skip_reason})")
+            file_status = "skipped"
+            file_status_message = file_skip_reason
         elif not file_has_text:
             if enable_ocr_fallback:
                 file_skip_reason = (
@@ -1334,6 +1464,12 @@ def run_name_search_progressive(
                     "no extractable text after PyPDF2, pypdf, pdfplumber, pymupdf, and pdftotext (OCR disabled)"
                 )
             skipped_files.append(f"{pdf_path} ({file_skip_reason})")
+            file_status = "skipped"
+            file_status_message = file_skip_reason
+
+        if file_stop_reason:
+            file_status = "stopped"
+            file_status_message = file_stop_reason
 
         extraction_debug.append(
             FileExtractionDebug(
@@ -1345,12 +1481,40 @@ def run_name_search_progressive(
                 skip_reason=file_skip_reason,
             )
         )
+        emit_lifecycle(
+            {
+                "event": "file_finished",
+                "folder_path": resolved_folder_path,
+                "current_file_index": file_index,
+                "total_files": len(pdf_files),
+                "file_name": pdf_path.name,
+                "file_path": str(pdf_path),
+                "total_pages": max_page_count,
+                "pages_processed": file_pages_processed,
+                "status": file_status,
+                "error_message": file_status_message or "",
+                "skip_reason": file_skip_reason or "",
+            }
+        )
 
-        if file_stopped_by_timeout:
+        if file_stop_reason:
             break
 
+    emit_lifecycle(
+        {
+            "event": "scan_finished",
+            "folder_path": resolved_folder_path,
+            "status": "processed" if scan_completed else "stopped",
+            "stop_reason": stop_reason,
+            "files_total": len(pdf_files),
+            "pages_processed": pages_processed,
+            "matches_found": len(all_matches),
+            "elapsed_seconds": elapsed_seconds(),
+        }
+    )
+
     return NameSearchOutcome(
-        folder_path=str(Path(folder_path).expanduser().resolve()),
+        folder_path=resolved_folder_path,
         names=names,
         pdf_files=[str(path) for path in pdf_files],
         skipped_files=skipped_files,

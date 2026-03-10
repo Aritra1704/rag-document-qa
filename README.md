@@ -33,13 +33,27 @@ pip install -r requirements.txt
 brew install tesseract
 ```
 
-4. (Optional, for Q&A answers via Claude) set your API key:
+4. Configure PostgreSQL for PDF Name Search persistence:
+
+```bash
+export DATABASE_URL="postgresql://username:password@localhost:5432/rag_document_qa"
+```
+
+Initialize tables/indexes (one-time):
+
+```bash
+psql "$DATABASE_URL" -f db/postgres/000_create_project_schema.sql
+psql "$DATABASE_URL" -f db/postgres/001_name_search_schema.sql
+psql "$DATABASE_URL" -f db/postgres/002_name_search_indexes.sql
+```
+
+5. (Optional, for Q&A answers via Claude) set your API key:
 
 ```bash
 export ANTHROPIC_API_KEY="your_key_here"
 ```
 
-5. Run the Streamlit app:
+6. Run the Streamlit app:
 
 ```bash
 streamlit run src/app.py
@@ -74,44 +88,74 @@ ollama pull qwen2.5:7b-instruct
 - Click `Process Documents`.
 - Ask questions in chat.
 
-### 2) PDF Name Search (new behavior)
+### 2) PDF Name Search (live + stored workflow)
 
-Select `Workflow -> PDF Name Search`, then provide on the same page:
+`Workflow -> PDF Name Search` now has two submodes:
+
+- `Live Scan Search`
+- `Search Stored Data`
+
+Main controls:
 
 - `Folder Path` (example: `/Users/aritra/Documents/pdfs`)
-- `Name to Search` (example: `John Smith`)
-- `Start page` (default `3`, scan begins from this page in every PDF)
-- `Enable OCR fallback` (only used when all standard extractors fail on a page)
+- `PostgreSQL DATABASE_URL (optional override)` (if empty, app uses `DATABASE_URL` or `PG*` env vars)
+- `Name to Search`
+- `Start page` (default `3`)
+- `Enable OCR fallback`
 - `OCR timeout per page (seconds)`
 - `Overall timeout (seconds, 0 = no timeout)`
-- Click `Search PDFs`
 
-UI output includes:
+Buttons:
 
-- total PDFs found
-- total matches found
-- scans all discovered PDFs progressively (not limited to a tiny file/page cap)
-- searched name
-- file name
-- full file path
-- page number
-- match position/index
-- snippet/context around each match
-- `match_type=exact_text` (direct text extractor) or `match_type=ocr_text` (OCR fallback)
-- skipped file warnings (corrupted/password-protected/no text)
-- clear not-found message when there are no matches
-- live scan status: file index, file name, page number, stage, elapsed time, skipped counts
-- partial matches rendered during the scan (not only at the end)
-- final stop reason: completed all files / overall timeout / interrupted run
+- `Search PDFs`: live progressive scan + exact matching + storage update
+- `Process & Store`: process folder pages and store parsed records for future fast queries
+- `Stop Scan`: interrupt current run and keep partial results
+- `Search Stored Data`: query previously stored structured records without rerunning OCR
 
-Optional diagnostics:
+Live UI output includes:
 
-- Enable `Show extraction debug details` to inspect per-file/per-page extractor attempts
-- Includes attempted extractor order, successful extractor, char counts, whitespace-only status, preview text, and errors
-- Includes OCR fallback diagnostics (attempted/success, OCR char count, preview text, OCR error message)
-- Includes environment diagnostics (`sys.executable`, `sys.version`, extractor/OCR importability, and `pdftotext`/`tesseract` command availability)
-- Includes a quick one-file diagnostic action (first 3 pages) for fast troubleshooting
-- Detailed page-level diagnostics are capped in the UI for responsiveness, while summary metrics still cover all scanned files/pages
+- progressive status (file index/total, current file, page number, stage)
+- pages processed, matches found, elapsed time, skipped counts
+- partial exact matches as they are found
+- final stop reason: completed all files / overall timeout / stopped by user / interrupted
+- deterministic result format:
+  - searched name
+  - file name
+  - full path
+  - page number
+  - match position
+  - snippet
+  - `match_type` (`exact_text` or `ocr_text`)
+
+Structured parsing + storage:
+
+- page text is parsed into voter-style records and stored locally
+- parsed fields:
+  - `serial_number`
+  - `elector_id`
+  - `name`
+  - `relative_name`
+  - `relative_type`
+  - `house_number`
+  - `age`
+  - `gender`
+  - `constituency`
+  - `section_name`
+  - `file_name`
+  - `file_path`
+  - `page_number`
+  - `extraction_method`
+  - `raw_record_text`
+- storage tracks statuses like `pending`, `processing`, `processed`, `skipped`, `failed`, `stopped`
+- app auto-runs table/index initialization on connect (`CREATE TABLE/INDEX IF NOT EXISTS`)
+- dedicated schema used by this project: `rag_document_qa`
+- SQLite-to-PostgreSQL data migration is not implemented yet (reprocess PDFs to repopulate Postgres)
+
+Optional diagnostics (Live mode):
+
+- `Show extraction debug details` shows per-file/per-page extractor attempts
+- includes OCR fallback debug columns and quick one-file diagnostic (first 3 pages)
+- includes raw winner text block per page (first 500 chars)
 
 ## Exact Search Behavior (Primary)
 
@@ -123,6 +167,7 @@ Optional diagnostics:
 - Text extraction fallback order: `PyPDF2 -> pypdf -> pdfplumber -> PyMuPDF(fitz) -> pdftotext` (when available)
 - OCR fallback: if all extractors return empty/whitespace for a page, OCR is attempted and used for matching
 - OCR fallback respects per-page OCR timeout to avoid stalling on one page
+- OCR remains fallback only (not first choice)
 - Match position/index is captured from page text
 - Snippet extraction around each match (not full page dump)
 - Multiple matches on same page are returned, with duplicate suppression
@@ -173,4 +218,8 @@ Key files for this feature:
 - `src/app.py` (workflow switch, PDF Name Search UI, Local Ollama RAG UI)
 - `src/ollama_rag.py` (local Ollama diagnostics, embeddings, and chat helpers)
 - `src/name_finder.py` (folder scan, PDF page extraction, exact/semantic search, CSV export, CLI)
+- `src/name_search_storage.py` (PostgreSQL storage adapter, OCR-text record parser, storage/search helpers)
+- `db/postgres/001_name_search_schema.sql` (PostgreSQL table creation)
+- `db/postgres/002_name_search_indexes.sql` (PostgreSQL indexes)
+- `db/postgres/000_create_project_schema.sql` (schema creation: `rag_document_qa`)
 - `tests/test_name_finder.py` (tests for name-search utilities and extraction debug behavior)
