@@ -100,7 +100,13 @@ Main controls:
 - `Folder Path` (example: `/Users/aritra/Documents/pdfs`)
 - `PostgreSQL DATABASE_URL (optional override)` (if empty, app uses `DATABASE_URL` or `PG*` env vars)
 - `Name to Search`
+- `Test mode` (default ON)
+- `Max files to process in test mode` (default `1`)
+- `Max pages per file in test mode` (default `1`)
 - `Start page` (default `3`)
+- `End page` (default `3` in test mode)
+- `Test file` dropdown (auto-first file or select one file)
+- `Replace existing records for selected test page` (default ON)
 - `Enable OCR fallback`
 - `OCR timeout per page (seconds)`
 - `Overall timeout (seconds, 0 = no timeout)`
@@ -109,6 +115,7 @@ Buttons:
 
 - `Search PDFs`: live progressive scan + exact matching + storage update
 - `Process & Store`: process folder pages and store parsed records for future fast queries
+- `Run 1-page DB test`: run controlled test-mode pipeline for one file/page
 - `Stop Scan`: interrupt current run and keep partial results
 - `Search Stored Data`: query previously stored structured records without rerunning OCR
 
@@ -156,6 +163,37 @@ Optional diagnostics (Live mode):
 - `Show extraction debug details` shows per-file/per-page extractor attempts
 - includes OCR fallback debug columns and quick one-file diagnostic (first 3 pages)
 - includes raw winner text block per page (first 500 chars)
+
+### 2.1) Quick 1-page PostgreSQL test (recommended before full run)
+
+1. Open `Workflow -> PDF Name Search -> Live Scan Search`
+2. Keep `Test mode` ON
+3. Set:
+   - `Max files to process in test mode = 1`
+   - `Max pages per file in test mode = 1`
+   - `Start page = 3`
+   - `End page = 3`
+4. Choose a `Test file` (or keep auto-first)
+5. Click `Run 1-page DB test`
+
+Turn `Test mode` OFF to restore full-scan behavior using the normal scan controls.
+
+The run still executes the full pipeline on that sample:
+
+- discover file(s)
+- text extraction
+- OCR fallback (if needed)
+- structured parsing
+- PostgreSQL insert
+
+After run, UI shows:
+
+- test-run summary (file/page, extraction method, OCR usage, parsed count, insert success count, insert errors)
+- PostgreSQL verification section for canonical tables:
+  - `documents` row for tested file
+  - `pages` row for tested page
+  - `parsed_records` rows for tested page
+  - row-count checks (`documents=1`, `pages=1`, `parsed_records > 1`)
 
 ## Exact Search Behavior (Primary)
 

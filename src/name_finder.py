@@ -1091,9 +1091,13 @@ def run_name_search_progressive(
     raw_names: str | Sequence[str],
     *,
     start_page: int = 3,
+    end_page: int | None = None,
     enable_ocr_fallback: bool = True,
     ocr_timeout_per_page: float | None = 20.0,
     overall_timeout_seconds: float | None = None,
+    pdf_files_override: Sequence[str | Path] | None = None,
+    max_files: int | None = None,
+    max_pages_per_file: int | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     lifecycle_callback: Callable[[dict[str, Any]], None] | None = None,
     stop_check: Callable[[], bool] | None = None,
@@ -1105,6 +1109,11 @@ def run_name_search_progressive(
         raise ValueError("Please provide at least one name to search.")
 
     normalized_start_page = max(1, int(start_page))
+    normalized_end_page = None if end_page is None else int(end_page)
+    if normalized_end_page is not None and normalized_end_page <= 0:
+        normalized_end_page = None
+    if normalized_end_page is not None and normalized_end_page < normalized_start_page:
+        normalized_end_page = normalized_start_page
     normalized_ocr_timeout = None if ocr_timeout_per_page is None else float(ocr_timeout_per_page)
     if normalized_ocr_timeout is not None and normalized_ocr_timeout <= 0:
         normalized_ocr_timeout = None
@@ -1113,7 +1122,29 @@ def run_name_search_progressive(
         normalized_overall_timeout = None
 
     resolved_folder_path = str(Path(folder_path).expanduser().resolve())
-    pdf_files = discover_pdf_files(folder_path)
+    if pdf_files_override is None:
+        pdf_files = discover_pdf_files(folder_path)
+    else:
+        seen_file_paths: set[str] = set()
+        pdf_files = []
+        for file_candidate in pdf_files_override:
+            resolved_file = Path(file_candidate).expanduser().resolve()
+            if resolved_file.suffix.lower() != ".pdf":
+                continue
+            file_key = str(resolved_file)
+            if file_key in seen_file_paths:
+                continue
+            seen_file_paths.add(file_key)
+            pdf_files.append(resolved_file)
+
+    normalized_max_files = None if max_files is None else int(max_files)
+    if normalized_max_files is not None and normalized_max_files > 0:
+        pdf_files = pdf_files[:normalized_max_files]
+
+    normalized_max_pages_per_file = None if max_pages_per_file is None else int(max_pages_per_file)
+    if normalized_max_pages_per_file is not None and normalized_max_pages_per_file <= 0:
+        normalized_max_pages_per_file = None
+
     patterns = {name: _build_name_pattern(name) for name in names}
     extractor_order = EXTRACTOR_ORDER
     start_time = time.perf_counter()
@@ -1240,6 +1271,12 @@ def run_name_search_progressive(
 
         max_page_count = max(extractor.page_count for extractor in extractors.values())
         start_page_index = max(0, normalized_start_page - 1)
+        page_end_index = max_page_count
+        if normalized_end_page is not None:
+            page_end_index = min(page_end_index, normalized_end_page)
+        if normalized_max_pages_per_file is not None:
+            page_end_index = min(page_end_index, start_page_index + normalized_max_pages_per_file)
+
         skipped_pages += min(start_page_index, max_page_count)
         page_debug_entries: List[PageExtractionDebug] = []
         file_has_text = False
@@ -1261,7 +1298,7 @@ def run_name_search_progressive(
         )
 
         try:
-            for page_index in range(start_page_index, max_page_count):
+            for page_index in range(start_page_index, page_end_index):
                 current_stop_reason = compute_stop_reason()
                 if current_stop_reason:
                     scan_completed = False
@@ -1449,8 +1486,13 @@ def run_name_search_progressive(
         file_skip_reason: str | None = None
         file_status = "processed"
         file_status_message: str | None = None
-        if start_page_index >= max_page_count:
-            file_skip_reason = f"no pages at or after start page {normalized_start_page}"
+        if start_page_index >= page_end_index:
+            if normalized_end_page is not None:
+                file_skip_reason = (
+                    f"no pages in selected range start={normalized_start_page}, end={normalized_end_page}"
+                )
+            else:
+                file_skip_reason = f"no pages at or after start page {normalized_start_page}"
             skipped_files.append(f"{pdf_path} ({file_skip_reason})")
             file_status = "skipped"
             file_status_message = file_skip_reason

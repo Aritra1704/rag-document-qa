@@ -25,7 +25,9 @@ from name_finder import (
     summarize_extraction_debug,
 )
 from name_search_storage import (
+    fetch_test_page_storage_verification,
     get_folder_storage_summary,
+    insert_page_records,
     open_storage_connection,
     parse_voter_records_from_page,
     replace_page_records,
@@ -120,8 +122,20 @@ if 'name_search_quick_debug' not in st.session_state:
     st.session_state.name_search_quick_debug = None
 if 'name_search_start_page' not in st.session_state:
     st.session_state.name_search_start_page = 3
+if 'name_search_end_page' not in st.session_state:
+    st.session_state.name_search_end_page = 3
 if 'name_search_enable_ocr_fallback' not in st.session_state:
     st.session_state.name_search_enable_ocr_fallback = True
+if 'name_search_test_mode' not in st.session_state:
+    st.session_state.name_search_test_mode = True
+if 'name_search_test_max_files' not in st.session_state:
+    st.session_state.name_search_test_max_files = 1
+if 'name_search_test_max_pages_per_file' not in st.session_state:
+    st.session_state.name_search_test_max_pages_per_file = 1
+if 'name_search_test_selected_file' not in st.session_state:
+    st.session_state.name_search_test_selected_file = "(auto: first discovered)"
+if 'name_search_test_replace_existing' not in st.session_state:
+    st.session_state.name_search_test_replace_existing = True
 if 'name_search_ocr_timeout_seconds' not in st.session_state:
     st.session_state.name_search_ocr_timeout_seconds = 20
 if 'name_search_overall_timeout_seconds' not in st.session_state:
@@ -146,6 +160,10 @@ if 'name_search_storage_summary' not in st.session_state:
     st.session_state.name_search_storage_summary = None
 if 'name_search_last_action' not in st.session_state:
     st.session_state.name_search_last_action = None
+if 'name_search_test_run_summary' not in st.session_state:
+    st.session_state.name_search_test_run_summary = None
+if 'name_search_test_verification_payload' not in st.session_state:
+    st.session_state.name_search_test_verification_payload = None
 if 'ollama_collection' not in st.session_state:
     st.session_state.ollama_collection = None
 if 'ollama_documents_processed' not in st.session_state:
@@ -852,13 +870,83 @@ def show_name_search_workflow():
             st.info("Provide a name and click `Search Stored Data`.")
         return
 
-    start_page = st.number_input(
+    test_mode = st.checkbox(
+        "Test mode",
+        value=bool(st.session_state.get("name_search_test_mode", True)),
+        help="Run a small controlled sample (for example 1 file x 1 page) to validate extraction, OCR, parsing, and DB insert.",
+    )
+    discovered_test_files: list[Path] = []
+    if folder_path.strip():
+        resolved_for_test = Path(folder_path).expanduser()
+        if resolved_for_test.exists() and resolved_for_test.is_dir():
+            try:
+                discovered_test_files = discover_pdf_files(resolved_for_test)
+            except Exception:  # noqa: BLE001
+                discovered_test_files = []
+
+    sample_col1, sample_col2 = st.columns(2)
+    start_page = sample_col1.number_input(
         "Start page",
         min_value=1,
         value=int(st.session_state.get("name_search_start_page", 3)),
         step=1,
         help="For each PDF, start scanning at this page number.",
     )
+    end_page_default = int(st.session_state.get("name_search_end_page", 3))
+    end_page_input = sample_col2.number_input(
+        "End page (optional, 0 = no end page)",
+        min_value=0,
+        value=end_page_default,
+        step=1,
+        help="Use 0 for no upper page limit.",
+    )
+    end_page = int(end_page_input) if int(end_page_input) > 0 else None
+
+    test_max_files = int(st.session_state.get("name_search_test_max_files", 1))
+    test_max_pages_per_file = int(st.session_state.get("name_search_test_max_pages_per_file", 1))
+    selected_test_file = str(st.session_state.get("name_search_test_selected_file", "(auto: first discovered)"))
+    test_replace_existing = bool(st.session_state.get("name_search_test_replace_existing", True))
+
+    if test_mode:
+        test_col1, test_col2 = st.columns(2)
+        test_max_files = int(
+            test_col1.number_input(
+                "Max files to process in test mode",
+                min_value=1,
+                value=int(st.session_state.get("name_search_test_max_files", 1)),
+                step=1,
+            )
+        )
+        test_max_pages_per_file = int(
+            test_col2.number_input(
+                "Max pages per file in test mode",
+                min_value=1,
+                value=int(st.session_state.get("name_search_test_max_pages_per_file", 1)),
+                step=1,
+            )
+        )
+
+        test_file_options = ["(auto: first discovered)"] + [str(path) for path in discovered_test_files]
+        if selected_test_file not in test_file_options:
+            selected_test_file = test_file_options[0]
+        selected_test_file = st.selectbox(
+            "Test file",
+            options=test_file_options,
+            index=test_file_options.index(selected_test_file),
+            key="name_search_test_selected_file",
+            help="Choose a specific PDF for testing. Leave auto to use the first discovered PDF.",
+        )
+        test_replace_existing = st.checkbox(
+            "Replace existing records for selected test page",
+            value=bool(st.session_state.get("name_search_test_replace_existing", True)),
+            key="name_search_test_replace_existing",
+            help="When enabled, existing records for the same document+page are replaced before test inserts.",
+        )
+        if discovered_test_files:
+            st.caption(f"Discovered PDFs for test mode: {len(discovered_test_files)}")
+        else:
+            st.caption("No PDFs discovered yet for test mode selection.")
+
     enable_ocr_fallback = st.checkbox(
         "Enable OCR fallback",
         value=bool(st.session_state.get("name_search_enable_ocr_fallback", True)),
@@ -885,10 +973,11 @@ def show_name_search_workflow():
         help="Show file/page-level extractor attempts to debug text extraction issues",
     )
 
-    action_col1, action_col2, action_col3 = st.columns(3)
+    action_col1, action_col2, action_col3, action_col4 = st.columns(4)
     search_clicked = action_col1.button("Search PDFs", type="primary")
     process_store_clicked = action_col2.button("Process & Store")
-    stop_clicked = action_col3.button("Stop Scan")
+    run_one_page_test_clicked = action_col3.button("Run 1-page DB test")
+    stop_clicked = action_col4.button("Stop Scan")
 
     if stop_clicked:
         st.session_state.name_search_stop_requested = True
@@ -910,7 +999,9 @@ def show_name_search_workflow():
         st.session_state.name_search_stop_requested = False
 
     action_mode = None
-    if search_clicked:
+    if run_one_page_test_clicked:
+        action_mode = "test_one_page"
+    elif search_clicked:
         action_mode = "search"
     elif process_store_clicked:
         action_mode = "process_store"
@@ -920,10 +1011,23 @@ def show_name_search_workflow():
         st.session_state.name_search_name = name_input
         st.session_state.name_search_db_path = db_path
         st.session_state.name_search_start_page = int(start_page)
+        st.session_state.name_search_end_page = int(end_page_input)
         st.session_state.name_search_enable_ocr_fallback = bool(enable_ocr_fallback)
+        st.session_state.name_search_test_mode = bool(test_mode)
+        st.session_state.name_search_test_max_files = int(test_max_files)
+        st.session_state.name_search_test_max_pages_per_file = int(test_max_pages_per_file)
+        st.session_state.name_search_test_selected_file = str(selected_test_file)
+        st.session_state.name_search_test_replace_existing = bool(test_replace_existing)
         st.session_state.name_search_ocr_timeout_seconds = int(ocr_timeout_seconds)
         st.session_state.name_search_overall_timeout_seconds = int(overall_timeout_seconds)
         st.session_state.name_search_last_action = action_mode
+
+        use_test_sampling = bool(test_mode) or action_mode == "test_one_page"
+        if action_mode == "test_one_page":
+            use_test_sampling = True
+            test_max_files = 1
+            test_max_pages_per_file = 1
+            end_page = int(start_page)
 
         if not folder_path.strip():
             st.session_state.name_search_outcome = None
@@ -931,6 +1035,9 @@ def show_name_search_workflow():
         elif action_mode == "search" and not name_input.strip():
             st.session_state.name_search_outcome = None
             st.warning("Please provide a name to search.")
+        elif end_page is not None and int(end_page) < int(start_page):
+            st.session_state.name_search_outcome = None
+            st.warning("End page must be greater than or equal to start page.")
         else:
             resolved_folder = Path(folder_path).expanduser()
             if not resolved_folder.exists() or not resolved_folder.is_dir():
@@ -944,9 +1051,29 @@ def show_name_search_workflow():
                     st.session_state.name_search_partial_structured_results = []
                     st.session_state.name_search_stored_results = []
                     st.session_state.name_search_storage_summary = None
+                    st.session_state.name_search_test_run_summary = None
+                    st.session_state.name_search_test_verification_payload = None
                     st.session_state.name_search_scan_in_progress = True
                     st.session_state.name_search_last_stop_reason = "running"
                     st.session_state.name_search_stop_requested = False
+
+                    selected_pdf_overrides: list[str] = []
+                    if use_test_sampling:
+                        if selected_test_file and selected_test_file != "(auto: first discovered)":
+                            selected_pdf_overrides = [selected_test_file]
+                        elif discovered_test_files:
+                            selected_pdf_overrides = [str(discovered_test_files[0])]
+
+                    test_run_stats: dict[str, Any] = {
+                        "test_mode_run": bool(use_test_sampling),
+                        "file_processed": "",
+                        "page_numbers_processed": [],
+                        "extraction_methods_used": {},
+                        "ocr_used": False,
+                        "parsed_records_count": 0,
+                        "postgres_insert_success_count": 0,
+                        "insert_errors": [],
+                    }
 
                     live_status_placeholder = st.empty()
                     live_metrics_placeholder = st.empty()
@@ -963,7 +1090,14 @@ def show_name_search_workflow():
                     resolved_scan_folder = str(resolved_folder.resolve())
                     if storage_connection is not None:
                         try:
-                            discovered_for_pending = discover_pdf_files(resolved_scan_folder)
+                            if use_test_sampling:
+                                if selected_pdf_overrides:
+                                    discovered_for_pending = [Path(path) for path in selected_pdf_overrides]
+                                else:
+                                    discovered_for_pending = list(discovered_test_files)
+                                discovered_for_pending = discovered_for_pending[: max(1, int(test_max_files))]
+                            else:
+                                discovered_for_pending = discover_pdf_files(resolved_scan_folder)
                             for pending_pdf_path in discovered_for_pending:
                                 upsert_document(
                                     storage_connection,
@@ -1113,31 +1247,75 @@ def show_name_search_workflow():
                                     extraction_method=extraction_method or "exact_text",
                                 )
 
-                            page_id = upsert_page(
-                                storage_connection,
-                                document_id=document_id,
-                                page_number=page_number_value,
-                                status=page_status,
-                                extraction_method=extraction_method or None,
-                                raw_text=text_for_storage,
-                                parsed_record_count=len(parsed_records),
-                                error_message=error_message or None,
-                            )
-                            replace_page_records(
-                                storage_connection,
-                                document_id=document_id,
-                                page_id=page_id,
-                                records=parsed_records,
-                            )
+                            inserted_count_for_page = 0
+                            try:
+                                page_id = upsert_page(
+                                    storage_connection,
+                                    document_id=document_id,
+                                    page_number=page_number_value,
+                                    status=page_status,
+                                    extraction_method=extraction_method or None,
+                                    raw_text=text_for_storage,
+                                    parsed_record_count=len(parsed_records),
+                                    error_message=error_message or None,
+                                )
+                                if use_test_sampling and not test_replace_existing:
+                                    insert_page_records(
+                                        storage_connection,
+                                        document_id=document_id,
+                                        page_id=page_id,
+                                        records=parsed_records,
+                                        page_number=page_number_value,
+                                        extraction_method=extraction_method,
+                                    )
+                                else:
+                                    replace_page_records(
+                                        storage_connection,
+                                        document_id=document_id,
+                                        page_id=page_id,
+                                        records=parsed_records,
+                                        page_number=page_number_value,
+                                        extraction_method=extraction_method,
+                                    )
+                                inserted_count_for_page = len(parsed_records)
+                            except Exception as exc:  # noqa: BLE001
+                                test_run_stats["insert_errors"].append(
+                                    f"{file_name_value} page {page_number_value}: {exc}"
+                                )
+                                inserted_count_for_page = 0
 
                             state["pages_processed"] = int(state.get("pages_processed", 0)) + 1
-                            update_document_status(
-                                storage_connection,
-                                document_id=document_id,
-                                status="processing",
-                                pages_processed=int(state["pages_processed"]),
-                                error_message=None,
-                            )
+                            try:
+                                update_document_status(
+                                    storage_connection,
+                                    document_id=document_id,
+                                    status="processing",
+                                    pages_processed=int(state["pages_processed"]),
+                                    error_message=None,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                test_run_stats["insert_errors"].append(
+                                    f"document status update failed for {file_name_value}: {exc}"
+                                )
+
+                            if use_test_sampling:
+                                if not test_run_stats["file_processed"]:
+                                    test_run_stats["file_processed"] = file_path_value
+                                if page_number_value not in test_run_stats["page_numbers_processed"]:
+                                    test_run_stats["page_numbers_processed"].append(page_number_value)
+                                extraction_method_key = extraction_method or "no_text"
+                                current_method_count = int(
+                                    test_run_stats["extraction_methods_used"].get(extraction_method_key, 0)
+                                )
+                                test_run_stats["extraction_methods_used"][extraction_method_key] = current_method_count + 1
+                                if bool(event.get("ocr_succeeded")) or extraction_method == "ocr_text":
+                                    test_run_stats["ocr_used"] = True
+                                test_run_stats["parsed_records_count"] = int(test_run_stats["parsed_records_count"]) + len(
+                                    parsed_records
+                                )
+                                test_run_stats["postgres_insert_success_count"] = int(
+                                    test_run_stats["postgres_insert_success_count"]
+                                ) + inserted_count_for_page
 
                             searched_name_value = name_input.strip()
                             if searched_name_value:
@@ -1214,22 +1392,34 @@ def show_name_search_workflow():
                             return
 
                     query_for_run = name_input.strip()
-                    if action_mode == "process_store" and not query_for_run:
+                    if action_mode in {"process_store", "test_one_page"} and not query_for_run:
                         query_for_run = "__process_and_store_only__"
 
                     spinner_text = (
-                        "Processing PDFs and storing parsed records..."
-                        if action_mode == "process_store"
-                        else "Scanning all PDFs progressively..."
+                        "Running 1-page PostgreSQL test..."
+                        if action_mode == "test_one_page"
+                        else (
+                            "Processing PDFs and storing parsed records..."
+                            if action_mode == "process_store"
+                            else "Scanning all PDFs progressively..."
+                        )
                     )
+                    end_page_for_run = int(end_page) if use_test_sampling and end_page is not None else None
+                    pdf_overrides_for_run = selected_pdf_overrides if use_test_sampling and selected_pdf_overrides else None
+                    max_files_for_run = int(test_max_files) if use_test_sampling else None
+                    max_pages_for_run = int(test_max_pages_per_file) if use_test_sampling else None
                     with st.spinner(spinner_text):
                         outcome = run_name_search_progressive(
                             folder_path=folder_path,
                             raw_names=query_for_run,
                             start_page=int(start_page),
+                            end_page=end_page_for_run,
                             enable_ocr_fallback=bool(enable_ocr_fallback),
                             ocr_timeout_per_page=float(ocr_timeout_seconds) if enable_ocr_fallback else None,
                             overall_timeout_seconds=float(overall_timeout_seconds) if overall_timeout_seconds > 0 else None,
+                            pdf_files_override=pdf_overrides_for_run,
+                            max_files=max_files_for_run,
+                            max_pages_per_file=max_pages_for_run,
                             progress_callback=_on_progress,
                             lifecycle_callback=_on_lifecycle,
                             stop_check=lambda: bool(st.session_state.get("name_search_stop_requested", False)),
@@ -1266,11 +1456,54 @@ def show_name_search_workflow():
                                 )
                         except Exception as exc:  # noqa: BLE001
                             st.warning(f"Scan completed but failed to load stored records summary: {exc}")
+                            test_run_stats["insert_errors"].append(f"summary/refresh query failed: {exc}")
+                    elif use_test_sampling:
+                        test_run_stats["insert_errors"].append("PostgreSQL connection unavailable for insert.")
+
+                    if use_test_sampling:
+                        processed_pages_sorted = sorted(int(page) for page in test_run_stats["page_numbers_processed"])
+                        file_processed = str(test_run_stats["file_processed"] or (outcome.pdf_files[0] if outcome.pdf_files else ""))
+                        verification_payload: dict[str, Any] | None = None
+                        if storage_connection is not None and file_processed and processed_pages_sorted:
+                            try:
+                                verification_payload = fetch_test_page_storage_verification(
+                                    storage_connection,
+                                    file_path=file_processed,
+                                    page_number=processed_pages_sorted[0],
+                                    limit=200,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                test_run_stats["insert_errors"].append(f"verification query failed: {exc}")
+                                verification_payload = None
+
+                        st.session_state.name_search_test_verification_payload = verification_payload
+                        st.session_state.name_search_test_run_summary = {
+                            "test_mode_run": True,
+                            "test_action": action_mode == "test_one_page",
+                            "file_processed": file_processed,
+                            "page_numbers_processed": processed_pages_sorted,
+                            "selected_start_page": int(start_page),
+                            "selected_end_page": int(end_page) if end_page is not None else None,
+                            "extraction_methods_used": dict(test_run_stats["extraction_methods_used"]),
+                            "ocr_used": bool(test_run_stats["ocr_used"]),
+                            "parsed_records_count": int(test_run_stats["parsed_records_count"]),
+                            "postgres_insert_success_count": int(test_run_stats["postgres_insert_success_count"]),
+                            "insert_errors": list(test_run_stats["insert_errors"]),
+                            "replace_existing": bool(test_replace_existing),
+                            "selected_test_file": str(selected_test_file),
+                        }
+                    else:
+                        st.session_state.name_search_test_run_summary = None
+                        st.session_state.name_search_test_verification_payload = None
 
                     if outcome.scan_completed:
                         if action_mode == "process_store":
                             st.success(
                                 f"Processing complete. PDFs discovered: {len(outcome.pdf_files)} | stop reason: {outcome.stop_reason}"
+                            )
+                        elif action_mode == "test_one_page":
+                            st.success(
+                                f"1-page DB test complete. PDFs discovered: {len(outcome.pdf_files)} | stop reason: {outcome.stop_reason}"
                             )
                         else:
                             st.success(
@@ -1308,7 +1541,7 @@ def show_name_search_workflow():
                     title="Structured Partial Records",
                 )
             return
-        st.info("Enter a folder path and a name, then click `Search PDFs` or `Process & Store`.")
+        st.info("Enter a folder path and a name, then click `Search PDFs`, `Process & Store`, or `Run 1-page DB test`.")
         return
 
     st.subheader("Results")
@@ -1345,9 +1578,87 @@ def show_name_search_workflow():
             for skipped in outcome.skipped_files:
                 st.write(f"- {skipped}")
 
+    test_run_summary = st.session_state.get("name_search_test_run_summary")
+    if test_run_summary:
+        extraction_methods_used = test_run_summary.get("extraction_methods_used", {})
+        extraction_methods_text = ", ".join(
+            f"{method}:{count}" for method, count in extraction_methods_used.items()
+        ) or "none"
+        processed_pages = test_run_summary.get("page_numbers_processed", [])
+        processed_pages_text = ", ".join(str(page) for page in processed_pages) if processed_pages else "none"
+
+        st.markdown("### Test-Run Summary")
+        summary_rows = [
+            {"Metric": "Test-mode run", "Value": "yes" if test_run_summary.get("test_mode_run") else "no"},
+            {"Metric": "Processed file", "Value": str(test_run_summary.get("file_processed") or "")},
+            {"Metric": "Processed page(s)", "Value": processed_pages_text},
+            {"Metric": "Selected start/end", "Value": f"{test_run_summary.get('selected_start_page')} / {test_run_summary.get('selected_end_page')}"},
+            {"Metric": "Extraction method(s)", "Value": extraction_methods_text},
+            {"Metric": "OCR used", "Value": "yes" if test_run_summary.get("ocr_used") else "no"},
+            {"Metric": "Parsed records count", "Value": int(test_run_summary.get("parsed_records_count", 0))},
+            {"Metric": "PostgreSQL insert success count", "Value": int(test_run_summary.get("postgres_insert_success_count", 0))},
+            {"Metric": "Replace existing enabled", "Value": "yes" if test_run_summary.get("replace_existing") else "no"},
+        ]
+        st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+
+        insert_errors = list(test_run_summary.get("insert_errors", []))
+        if insert_errors:
+            with st.expander("Test insert errors"):
+                for error in insert_errors:
+                    st.write(f"- {error}")
+
+        verification_payload = st.session_state.get("name_search_test_verification_payload")
+        st.markdown("### PostgreSQL Verification (Canonical Tables)")
+        if verification_payload:
+            verification_counts = verification_payload.get("counts", {})
+            verification_checks = verification_payload.get("checks", {})
+
+            checks_rows = [
+                {
+                    "Check": "Exactly one documents row (or existing reused row)",
+                    "Result": "pass" if verification_checks.get("single_document_row") else "fail",
+                    "Observed count": int(verification_counts.get("documents", 0)),
+                },
+                {
+                    "Check": "Exactly one pages row for selected page",
+                    "Result": "pass" if verification_checks.get("single_page_row") else "fail",
+                    "Observed count": int(verification_counts.get("pages", 0)),
+                },
+                {
+                    "Check": "Multiple parsed_records rows for selected page",
+                    "Result": "pass" if verification_checks.get("multiple_parsed_records") else "check data",
+                    "Observed count": int(verification_counts.get("parsed_records", 0)),
+                },
+            ]
+            st.dataframe(checks_rows, use_container_width=True, hide_index=True)
+
+            document_rows = verification_payload.get("documents", [])
+            page_rows = verification_payload.get("pages", [])
+            parsed_record_rows = verification_payload.get("parsed_records", [])
+
+            st.markdown("#### documents row")
+            if document_rows:
+                st.dataframe(document_rows, use_container_width=True, hide_index=True)
+            else:
+                st.info("No documents row found for selected file_path.")
+
+            st.markdown("#### pages row")
+            if page_rows:
+                st.dataframe(page_rows, use_container_width=True, hide_index=True)
+            else:
+                st.info("No pages row found for selected file_path + page_number.")
+
+            st.markdown("#### parsed_records rows")
+            if parsed_record_rows:
+                st.dataframe(parsed_record_rows, use_container_width=True, hide_index=True)
+            else:
+                st.info("No parsed_records rows found for selected test page.")
+        else:
+            st.info("No stored rows found yet for the selected test page.")
+
     input_name_value = name_input.strip()
     last_action = st.session_state.get("name_search_last_action")
-    if last_action == "process_store" and not input_name_value:
+    if last_action in {"process_store", "test_one_page"} and not input_name_value:
         searched_name = ""
     else:
         searched_name = outcome.names[0] if outcome.names else input_name_value

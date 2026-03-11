@@ -272,11 +272,48 @@ def replace_page_records(
     document_id: int,
     page_id: int,
     records: Sequence[dict[str, Any]],
+    page_number: int | None = None,
+    extraction_method: str | None = None,
 ) -> None:
     connection.execute("DELETE FROM parsed_records WHERE page_id = %s", (int(page_id),))
+    insert_page_records(
+        connection,
+        document_id=document_id,
+        page_id=page_id,
+        records=records,
+        page_number=page_number,
+        extraction_method=extraction_method,
+    )
+    connection.commit()
+
+
+def insert_page_records(
+    connection,
+    *,
+    document_id: int,
+    page_id: int,
+    records: Sequence[dict[str, Any]],
+    page_number: int | None = None,
+    extraction_method: str | None = None,
+) -> None:
     now = _utc_now_iso()
+    forced_page_number = int(page_number) if page_number is not None else None
+    forced_extraction_method = (extraction_method or "").strip()
     for record in records:
         name_value = str(record.get("name") or "")
+        record_page_number = forced_page_number
+        if record_page_number is None:
+            raw_page_number = record.get("page_number")
+            if raw_page_number is None:
+                raise ValueError("Parsed record missing page_number for parsed_records insert.")
+            record_page_number = int(raw_page_number)
+        if int(record_page_number) <= 0:
+            raise ValueError(f"Invalid parsed record page_number: {record_page_number}")
+
+        record_extraction_method = forced_extraction_method or str(record.get("extraction_method") or "").strip()
+        if not record_extraction_method:
+            record_extraction_method = "unknown"
+
         connection.execute(
             """
             INSERT INTO parsed_records (
@@ -303,8 +340,8 @@ def replace_page_records(
                 record.get("section_name"),
                 record.get("file_name") or "",
                 record.get("file_path") or "",
-                int(record.get("page_number") or 0),
-                record.get("extraction_method") or "",
+                int(record_page_number),
+                record_extraction_method,
                 record.get("raw_record_text") or "",
                 name_value.strip().lower() if name_value else None,
                 now,
@@ -386,6 +423,187 @@ def search_stored_records(
         (folder_path, f"%{normalized_query}%", f"%{normalized_query}%", int(limit)),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def fetch_page_records_for_verification(
+    connection,
+    *,
+    file_path: str,
+    page_number: int,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT
+            d.id AS document_id,
+            p.id AS page_id,
+            r.id AS parsed_record_id,
+            r.serial_number,
+            r.elector_id,
+            r.name,
+            r.relative_name,
+            r.relative_type,
+            r.house_number,
+            r.age,
+            r.gender,
+            r.constituency,
+            r.section_name,
+            r.file_name,
+            r.file_path,
+            r.page_number,
+            r.extraction_method,
+            r.raw_record_text
+        FROM parsed_records r
+        JOIN pages p ON p.id = r.page_id
+        JOIN documents d ON d.id = r.document_id
+        WHERE d.file_path = %s
+          AND p.page_number = %s
+        ORDER BY r.id
+        LIMIT %s
+        """,
+        (file_path, int(page_number), int(limit)),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def fetch_test_page_storage_verification(
+    connection,
+    *,
+    file_path: str,
+    page_number: int,
+    limit: int = 200,
+) -> dict[str, Any]:
+    counts_row = connection.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM documents d WHERE d.file_path = %s) AS documents_count,
+            (
+                SELECT COUNT(*)
+                FROM pages p
+                JOIN documents d ON d.id = p.document_id
+                WHERE d.file_path = %s
+                  AND p.page_number = %s
+            ) AS pages_count,
+            (
+                SELECT COUNT(*)
+                FROM parsed_records r
+                JOIN pages p ON p.id = r.page_id
+                JOIN documents d ON d.id = r.document_id
+                WHERE d.file_path = %s
+                  AND p.page_number = %s
+            ) AS parsed_records_count
+        """,
+        (
+            file_path,
+            file_path,
+            int(page_number),
+            file_path,
+            int(page_number),
+        ),
+    ).fetchone()
+
+    document_rows = connection.execute(
+        """
+        SELECT
+            d.id,
+            d.folder_path,
+            d.file_name,
+            d.file_path,
+            d.pages_total,
+            d.pages_processed,
+            d.status,
+            d.error_message,
+            d.last_modified,
+            d.file_size,
+            d.last_processed_at,
+            d.created_at,
+            d.updated_at
+        FROM documents d
+        WHERE d.file_path = %s
+        ORDER BY d.id
+        LIMIT 1
+        """,
+        (file_path,),
+    ).fetchall()
+
+    page_rows = connection.execute(
+        """
+        SELECT
+            p.id,
+            p.document_id,
+            p.page_number,
+            p.status,
+            p.extraction_method,
+            p.raw_text,
+            p.parsed_record_count,
+            p.error_message,
+            p.processed_at,
+            p.created_at,
+            p.updated_at
+        FROM pages p
+        JOIN documents d ON d.id = p.document_id
+        WHERE d.file_path = %s
+          AND p.page_number = %s
+        ORDER BY p.id
+        LIMIT 1
+        """,
+        (file_path, int(page_number)),
+    ).fetchall()
+
+    parsed_record_rows = connection.execute(
+        """
+        SELECT
+            r.id,
+            r.document_id,
+            r.page_id,
+            r.serial_number,
+            r.elector_id,
+            r.name,
+            r.relative_name,
+            r.relative_type,
+            r.house_number,
+            r.age,
+            r.gender,
+            r.constituency,
+            r.section_name,
+            r.file_name,
+            r.file_path,
+            r.page_number,
+            r.extraction_method,
+            r.raw_record_text,
+            r.name_normalized,
+            r.created_at,
+            r.updated_at
+        FROM parsed_records r
+        JOIN pages p ON p.id = r.page_id
+        JOIN documents d ON d.id = r.document_id
+        WHERE d.file_path = %s
+          AND p.page_number = %s
+        ORDER BY r.id
+        LIMIT %s
+        """,
+        (file_path, int(page_number), int(limit)),
+    ).fetchall()
+
+    documents_count = int(counts_row["documents_count"]) if counts_row else 0
+    pages_count = int(counts_row["pages_count"]) if counts_row else 0
+    parsed_records_count = int(counts_row["parsed_records_count"]) if counts_row else 0
+
+    return {
+        "counts": {
+            "documents": documents_count,
+            "pages": pages_count,
+            "parsed_records": parsed_records_count,
+        },
+        "checks": {
+            "single_document_row": documents_count == 1,
+            "single_page_row": pages_count == 1,
+            "multiple_parsed_records": parsed_records_count > 1,
+        },
+        "documents": [dict(row) for row in document_rows],
+        "pages": [dict(row) for row in page_rows],
+        "parsed_records": [dict(row) for row in parsed_record_rows],
+    }
 
 
 def _extract_context(text: str) -> tuple[str, str]:

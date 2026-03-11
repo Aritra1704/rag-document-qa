@@ -12,5 +12,6 @@ CREATE INDEX IF NOT EXISTS idx_pages_document_page ON pages(document_id, page_nu
 CREATE INDEX IF NOT EXISTS idx_records_name_normalized ON parsed_records(name_normalized);
 CREATE INDEX IF NOT EXISTS idx_records_lower_name ON parsed_records(LOWER(name));
 CREATE INDEX IF NOT EXISTS idx_records_elector_id ON parsed_records(elector_id);
+CREATE INDEX IF NOT EXISTS idx_records_page_id ON parsed_records(page_id);
 CREATE INDEX IF NOT EXISTS idx_records_document_page ON parsed_records(document_id, page_number);
 CREATE INDEX IF NOT EXISTS idx_records_document_page_id ON parsed_records(document_id, page_id);
