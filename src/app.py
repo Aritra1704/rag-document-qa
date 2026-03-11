@@ -18,6 +18,11 @@ import os
 import logging
 import re
 from typing import List, Tuple, Optional, Any
+try:
+    from dotenv import load_dotenv
+except Exception:  # noqa: BLE001
+    def load_dotenv(*args, **kwargs):  # type: ignore[no-redef]
+        return False
 from name_finder import (
     collect_pdf_pages,
     discover_pdf_files,
@@ -29,7 +34,7 @@ from name_search_storage import (
     get_folder_storage_summary,
     insert_page_records,
     open_storage_connection,
-    parse_voter_records_from_page,
+    parse_voter_records_from_page_layout_aware,
     replace_page_records,
     search_stored_records,
     update_document_status,
@@ -41,6 +46,23 @@ from ollama_rag import (
     generate_ollama_answer,
     get_ollama_diagnostics,
 )
+
+# Load local .env for Streamlit runs where shell env is not exported.
+_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=_ENV_PATH, override=False)
+if _ENV_PATH.exists():
+    for raw_line in _ENV_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and ((value[0] == value[-1] == '"') or (value[0] == value[-1] == "'")):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -164,6 +186,8 @@ if 'name_search_test_run_summary' not in st.session_state:
     st.session_state.name_search_test_run_summary = None
 if 'name_search_test_verification_payload' not in st.session_state:
     st.session_state.name_search_test_verification_payload = None
+if 'name_search_test_card_layout_debug' not in st.session_state:
+    st.session_state.name_search_test_card_layout_debug = None
 if 'ollama_collection' not in st.session_state:
     st.session_state.ollama_collection = None
 if 'ollama_documents_processed' not in st.session_state:
@@ -1016,8 +1040,6 @@ def show_name_search_workflow():
         st.session_state.name_search_test_mode = bool(test_mode)
         st.session_state.name_search_test_max_files = int(test_max_files)
         st.session_state.name_search_test_max_pages_per_file = int(test_max_pages_per_file)
-        st.session_state.name_search_test_selected_file = str(selected_test_file)
-        st.session_state.name_search_test_replace_existing = bool(test_replace_existing)
         st.session_state.name_search_ocr_timeout_seconds = int(ocr_timeout_seconds)
         st.session_state.name_search_overall_timeout_seconds = int(overall_timeout_seconds)
         st.session_state.name_search_last_action = action_mode
@@ -1053,6 +1075,7 @@ def show_name_search_workflow():
                     st.session_state.name_search_storage_summary = None
                     st.session_state.name_search_test_run_summary = None
                     st.session_state.name_search_test_verification_payload = None
+                    st.session_state.name_search_test_card_layout_debug = None
                     st.session_state.name_search_scan_in_progress = True
                     st.session_state.name_search_last_stop_reason = "running"
                     st.session_state.name_search_stop_requested = False
@@ -1073,6 +1096,7 @@ def show_name_search_workflow():
                         "parsed_records_count": 0,
                         "postgres_insert_success_count": 0,
                         "insert_errors": [],
+                        "card_layout_debug": None,
                     }
 
                     live_status_placeholder = st.empty()
@@ -1238,14 +1262,48 @@ def show_name_search_workflow():
                             error_message = str(event.get("error_message") or "")
 
                             parsed_records: list[dict[str, Any]] = []
-                            if text_for_storage.strip():
-                                parsed_records = parse_voter_records_from_page(
+                            card_layout_debug_payload: dict[str, Any] = {}
+                            try:
+                                card_parse_payload = parse_voter_records_from_page_layout_aware(
                                     page_text=text_for_storage,
                                     file_name=file_name_value,
                                     file_path=file_path_value,
                                     page_number=page_number_value,
                                     extraction_method=extraction_method or "exact_text",
+                                    ocr_timeout_seconds=float(ocr_timeout_seconds) if enable_ocr_fallback else None,
+                                    max_preview_cards=5 if use_test_sampling else 2,
+                                    include_card_debug=bool(use_test_sampling),
                                 )
+                                parsed_records = list(card_parse_payload.get("records", []))
+                                card_layout_debug_payload = dict(card_parse_payload.get("debug", {}))
+                            except Exception as exc:  # noqa: BLE001
+                                test_run_stats["insert_errors"].append(
+                                    f"layout parser failed for {file_name_value} page {page_number_value}: {exc}"
+                                )
+                                parsed_records = []
+                                card_layout_debug_payload = {
+                                    "mode": "card_ocr_layout",
+                                    "detection_strategy": "error",
+                                    "detection_error": str(exc),
+                                    "cards_detected": 0,
+                                    "cards_with_text": 0,
+                                    "cards_parsed": 0,
+                                    "cards": [],
+                                }
+
+                            if use_test_sampling and not test_run_stats.get("card_layout_debug"):
+                                test_run_stats["card_layout_debug"] = card_layout_debug_payload
+
+                            if parsed_records and not text_for_storage.strip():
+                                text_for_storage = "\n\n".join(
+                                    str(record.get("raw_record_text") or "").strip()
+                                    for record in parsed_records
+                                    if str(record.get("raw_record_text") or "").strip()
+                                )
+                            if parsed_records and page_status != "processed":
+                                page_status = "processed"
+                            if parsed_records and not extraction_method:
+                                extraction_method = "card_ocr_layout"
 
                             inserted_count_for_page = 0
                             try:
@@ -1266,7 +1324,7 @@ def show_name_search_workflow():
                                         page_id=page_id,
                                         records=parsed_records,
                                         page_number=page_number_value,
-                                        extraction_method=extraction_method,
+                                        extraction_method=None,
                                     )
                                 else:
                                     replace_page_records(
@@ -1275,7 +1333,7 @@ def show_name_search_workflow():
                                         page_id=page_id,
                                         records=parsed_records,
                                         page_number=page_number_value,
-                                        extraction_method=extraction_method,
+                                        extraction_method=None,
                                     )
                                 inserted_count_for_page = len(parsed_records)
                             except Exception as exc:  # noqa: BLE001
@@ -1464,6 +1522,7 @@ def show_name_search_workflow():
                         processed_pages_sorted = sorted(int(page) for page in test_run_stats["page_numbers_processed"])
                         file_processed = str(test_run_stats["file_processed"] or (outcome.pdf_files[0] if outcome.pdf_files else ""))
                         verification_payload: dict[str, Any] | None = None
+                        card_layout_debug_payload = test_run_stats.get("card_layout_debug")
                         if storage_connection is not None and file_processed and processed_pages_sorted:
                             try:
                                 verification_payload = fetch_test_page_storage_verification(
@@ -1477,6 +1536,7 @@ def show_name_search_workflow():
                                 verification_payload = None
 
                         st.session_state.name_search_test_verification_payload = verification_payload
+                        st.session_state.name_search_test_card_layout_debug = card_layout_debug_payload
                         st.session_state.name_search_test_run_summary = {
                             "test_mode_run": True,
                             "test_action": action_mode == "test_one_page",
@@ -1491,10 +1551,16 @@ def show_name_search_workflow():
                             "insert_errors": list(test_run_stats["insert_errors"]),
                             "replace_existing": bool(test_replace_existing),
                             "selected_test_file": str(selected_test_file),
+                            "card_layout_mode": str((card_layout_debug_payload or {}).get("mode") or ""),
+                            "card_detection_strategy": str((card_layout_debug_payload or {}).get("detection_strategy") or ""),
+                            "cards_detected": int((card_layout_debug_payload or {}).get("cards_detected") or 0),
+                            "cards_with_text": int((card_layout_debug_payload or {}).get("cards_with_text") or 0),
+                            "cards_parsed": int((card_layout_debug_payload or {}).get("cards_parsed") or 0),
                         }
                     else:
                         st.session_state.name_search_test_run_summary = None
                         st.session_state.name_search_test_verification_payload = None
+                        st.session_state.name_search_test_card_layout_debug = None
 
                     if outcome.scan_completed:
                         if action_mode == "process_store":
@@ -1595,9 +1661,14 @@ def show_name_search_workflow():
             {"Metric": "Selected start/end", "Value": f"{test_run_summary.get('selected_start_page')} / {test_run_summary.get('selected_end_page')}"},
             {"Metric": "Extraction method(s)", "Value": extraction_methods_text},
             {"Metric": "OCR used", "Value": "yes" if test_run_summary.get("ocr_used") else "no"},
-            {"Metric": "Parsed records count", "Value": int(test_run_summary.get("parsed_records_count", 0))},
-            {"Metric": "PostgreSQL insert success count", "Value": int(test_run_summary.get("postgres_insert_success_count", 0))},
+            {"Metric": "Parsed records count", "Value": str(int(test_run_summary.get("parsed_records_count", 0)))},
+            {"Metric": "PostgreSQL insert success count", "Value": str(int(test_run_summary.get("postgres_insert_success_count", 0)))},
             {"Metric": "Replace existing enabled", "Value": "yes" if test_run_summary.get("replace_existing") else "no"},
+            {"Metric": "Card parser mode", "Value": str(test_run_summary.get("card_layout_mode") or "")},
+            {"Metric": "Card detection strategy", "Value": str(test_run_summary.get("card_detection_strategy") or "")},
+            {"Metric": "Cards detected", "Value": str(int(test_run_summary.get("cards_detected", 0)))},
+            {"Metric": "Cards OCR text", "Value": str(int(test_run_summary.get("cards_with_text", 0)))},
+            {"Metric": "Cards parsed to records", "Value": str(int(test_run_summary.get("cards_parsed", 0)))},
         ]
         st.dataframe(summary_rows, use_container_width=True, hide_index=True)
 
@@ -1606,6 +1677,45 @@ def show_name_search_workflow():
             with st.expander("Test insert errors"):
                 for error in insert_errors:
                     st.write(f"- {error}")
+
+        card_layout_debug_payload = st.session_state.get("name_search_test_card_layout_debug")
+        if card_layout_debug_payload:
+            st.markdown("### Card-Level OCR Debug (Test Page)")
+            detection_error = str(card_layout_debug_payload.get("detection_error") or "")
+            if detection_error:
+                st.caption(f"Detection note: {detection_error}")
+
+            preview_cards = list(card_layout_debug_payload.get("cards", []))[:5]
+            if preview_cards:
+                for card_debug in preview_cards:
+                    card_index = int(card_debug.get("card_index") or 0)
+                    bbox = card_debug.get("bbox") or {}
+                    bbox_text = (
+                        f"x1={bbox.get('x1', '')}, y1={bbox.get('y1', '')}, "
+                        f"x2={bbox.get('x2', '')}, y2={bbox.get('y2', '')}"
+                    )
+                    accepted_text = "yes" if bool(card_debug.get("accepted")) else "no"
+                    st.markdown(f"#### Card #{card_index} | accepted: {accepted_text}")
+                    st.caption(f"bbox: {bbox_text}")
+
+                    crop_bytes = card_debug.get("crop_png_bytes")
+                    if crop_bytes:
+                        st.image(crop_bytes, caption=f"Card #{card_index} crop preview", width=280)
+
+                    ocr_text = str(card_debug.get("ocr_text") or "")
+                    if ocr_text:
+                        st.code(ocr_text, language="text")
+                    else:
+                        st.info("No OCR text for this card region.")
+
+                    parsed_record = card_debug.get("parsed_record")
+                    if parsed_record:
+                        st.json(parsed_record)
+                    else:
+                        reject_reason = str(card_debug.get("reject_reason") or "not parsed")
+                        st.caption(f"Skipped card reason: {reject_reason}")
+            else:
+                st.info("No card-level debug rows captured for this page.")
 
         verification_payload = st.session_state.get("name_search_test_verification_payload")
         st.markdown("### PostgreSQL Verification (Canonical Tables)")
