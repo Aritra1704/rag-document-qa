@@ -27,6 +27,16 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+OpenCV/Numpy compatibility for card detection:
+
+- This project expects `numpy>=1.26,<2.0` with `opencv-python>=4.10.0`.
+- If you see `cv2`/numpy mismatch errors, clean and reinstall inside the venv:
+
+```bash
+pip uninstall -y opencv-python opencv-python-headless numpy
+pip install -r requirements.txt
+```
+
 3. Install Tesseract (required for OCR fallback on scanned/image PDFs):
 
 ```bash

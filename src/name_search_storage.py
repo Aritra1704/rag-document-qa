@@ -663,32 +663,118 @@ def fetch_test_page_storage_verification(
     }
 
 
+def _normalize_context_value(raw_value: str) -> str:
+    value = " ".join(str(raw_value or "").split()).strip(" :-|")
+    if not value:
+        return ""
+    value = re.sub(r"(?i)^no\.?\s+and\s+name\s*[:\-]?\s*", "", value).strip(" :-|")
+    value = re.sub(r"(?i)\bpart\s*no\.?\s*[:\-]?\s*\d+\b.*$", "", value).strip(" :-|")
+    return value[:200]
+
+
 def _extract_context(text: str) -> tuple[str, str]:
     constituency = ""
     section_name = ""
 
     constituency_patterns = [
-        r"(?im)\b(?:assembly\s+constituency|constituency|ac\s*name)\b\s*[:\-]?\s*([^\n]+)",
-        r"(?im)\b(?:constituency\s+name)\b\s*[:\-]?\s*([^\n]+)",
+        r"(?im)^\s*assembly\s+constituency\s*(?:no\.?)?\s*(?:and|&)?\s*name\s*[:\-]\s*([^\n]+)",
+        r"(?im)^\s*constituency\s*(?:no\.?)?\s*(?:and|&)?\s*name\s*[:\-]\s*([^\n]+)",
+        r"(?im)^\s*(?:assembly\s+constituency|constituency|ac\s*name|constituency\s+name)\s*[:\-]\s*([^\n]+)",
     ]
     section_patterns = [
-        r"(?im)\b(?:section\s*name|part\s*name|polling\s*station)\b\s*[:\-]?\s*([^\n]+)",
-        r"(?im)\b(?:part\s*no\.?\s*and\s*name)\b\s*[:\-]?\s*([^\n]+)",
+        r"(?im)^\s*section\s*(?:no\.?)?\s*(?:and|&)?\s*name\s*[:\-]\s*([^\n]+)",
+        r"(?im)^\s*(?:section\s*name|part\s*name|polling\s*station)\s*[:\-]\s*([^\n]+)",
+        r"(?im)^\s*part\s*no\.?\s*and\s*name\s*[:\-]\s*([^\n]+)",
     ]
 
     for pattern in constituency_patterns:
-        match = re.search(pattern, text)
+        match = re.search(pattern, text or "")
         if match:
-            constituency = " ".join(match.group(1).split())[:200]
-            break
+            constituency = _normalize_context_value(match.group(1))
+            if constituency:
+                break
 
     for pattern in section_patterns:
-        match = re.search(pattern, text)
+        match = re.search(pattern, text or "")
         if match:
-            section_name = " ".join(match.group(1).split())[:200]
-            break
+            section_name = _normalize_context_value(match.group(1))
+            if section_name:
+                break
 
     return constituency, section_name
+
+
+def _extract_part_number(text: str) -> str:
+    lines = [line.strip() for line in str(text or "").replace("\r", "\n").splitlines() if line.strip()]
+    part_pattern = re.compile(r"(?i)^part\s*no\.?\s*[:\-]?\s*(.*)$")
+    for index, line in enumerate(lines):
+        match = part_pattern.search(line)
+        if not match:
+            continue
+        immediate_value = _normalize_context_value(match.group(1))
+        if immediate_value and re.search(r"\d", immediate_value):
+            return immediate_value[:40]
+        if index + 1 < len(lines):
+            next_line = _normalize_context_value(lines[index + 1])
+            if next_line and re.search(r"\d", next_line):
+                return next_line[:40]
+    fallback_match = re.search(r"(?im)\bpart\s*no\.?\s*[:\-]?\s*([A-Za-z0-9/\-]{1,40})", str(text or ""))
+    if fallback_match:
+        return _normalize_context_value(fallback_match.group(1))[:40]
+    return ""
+
+
+def _extract_page_header_metadata(
+    *,
+    page_image,
+    support_boxes: Sequence[tuple[int, int, int, int]],
+    ocr_timeout_seconds: float | None,
+    include_preview: bool,
+) -> dict[str, Any]:
+    page_width, page_height = page_image.size
+    support_top = min(box[1] for box in support_boxes) if support_boxes else int(page_height * 0.24)
+    max_header_bottom = int(page_height * 0.30)
+    min_header_bottom = int(page_height * 0.12)
+    header_bottom = int(round(support_top - max(8, page_height * 0.005)))
+    header_bottom = max(min_header_bottom, min(max_header_bottom, header_bottom))
+    if header_bottom <= 8:
+        header_bottom = max(10, int(page_height * 0.20))
+
+    header_bbox = (0, 0, int(page_width), int(header_bottom))
+    header_crop = page_image.crop(header_bbox)
+    header_text, header_ocr_error, header_ocr_meta = _ocr_card_image(
+        header_crop,
+        timeout_seconds=min(float(ocr_timeout_seconds or 20), 8.0),
+    )
+    constituency, section_name = _extract_context(header_text)
+    part_number = _extract_part_number(header_text)
+
+    header_preview_bytes: bytes | None = None
+    if include_preview:
+        try:
+            preview_buffer = io.BytesIO()
+            header_crop.save(preview_buffer, format="PNG")
+            header_preview_bytes = preview_buffer.getvalue()
+        except Exception:  # noqa: BLE001
+            header_preview_bytes = None
+
+    return {
+        "bbox": {
+            "x1": int(header_bbox[0]),
+            "y1": int(header_bbox[1]),
+            "x2": int(header_bbox[2]),
+            "y2": int(header_bbox[3]),
+        },
+        "ocr_text": str(header_text or ""),
+        "ocr_error": header_ocr_error,
+        "ocr_preprocess": (header_ocr_meta or {}).get("preprocess"),
+        "crop_png_bytes": header_preview_bytes,
+        "metadata": {
+            "constituency": constituency or None,
+            "section_name": section_name or None,
+            "part_number": part_number or None,
+        },
+    }
 
 
 def _split_candidate_blocks(text: str) -> list[str]:
@@ -801,19 +887,17 @@ def _float_env(name: str, default: float, *, minimum: float, maximum: float) -> 
 
 def _build_grid_card_boxes(width: int, height: int) -> list[tuple[int, int, int, int]]:
     cols = 3
+    rows = int(round(_float_env("NAME_SEARCH_SLOT_ROWS", 10, minimum=8, maximum=12)))
     margin_x = int(width * 0.03)
     top_margin = int(height * 0.18)
     bottom_margin = int(height * 0.03)
     gap_x = max(4, int(width * 0.008))
+    gap_y = max(4, int(height * 0.006))
 
     usable_width = max(10, width - (2 * margin_x) - (gap_x * (cols - 1)))
+    usable_height = max(10, height - top_margin - bottom_margin - (gap_y * (rows - 1)))
     box_width = max(10, usable_width // cols)
-    estimated_box_height = max(10, int(box_width / 2.0))
-    usable_height = max(10, height - top_margin - bottom_margin)
-    rows = max(7, min(11, int(round(usable_height / max(estimated_box_height, 1)))))
-    gap_y = max(4, int(height * 0.005))
-    usable_height_with_gaps = max(10, usable_height - (gap_y * (rows - 1)))
-    box_height = max(10, usable_height_with_gaps // rows)
+    box_height = max(10, usable_height // rows)
 
     boxes: list[tuple[int, int, int, int]] = []
     for row_index in range(rows):
@@ -866,18 +950,41 @@ def _expand_box(
     *,
     width: int,
     height: int,
+    pad_left_ratio: float | None = None,
+    pad_right_ratio: float | None = None,
+    pad_top_ratio: float | None = None,
+    pad_bottom_ratio: float | None = None,
+    extra_top_ratio: float = 0.0,
 ) -> tuple[int, int, int, int]:
-    pad_left_ratio = _float_env("NAME_SEARCH_CARD_PAD_LEFT", 0.02, minimum=0.0, maximum=0.1)
-    pad_right_ratio = _float_env("NAME_SEARCH_CARD_PAD_RIGHT", 0.02, minimum=0.0, maximum=0.1)
-    pad_top_ratio = _float_env("NAME_SEARCH_CARD_PAD_TOP", 0.03, minimum=0.0, maximum=0.12)
-    pad_bottom_ratio = _float_env("NAME_SEARCH_CARD_PAD_BOTTOM", 0.05, minimum=0.0, maximum=0.15)
+    resolved_left = (
+        _float_env("NAME_SEARCH_CARD_PAD_LEFT", 0.03, minimum=0.0, maximum=0.15)
+        if pad_left_ratio is None
+        else max(0.0, min(0.15, float(pad_left_ratio)))
+    )
+    resolved_right = (
+        _float_env("NAME_SEARCH_CARD_PAD_RIGHT", 0.03, minimum=0.0, maximum=0.15)
+        if pad_right_ratio is None
+        else max(0.0, min(0.15, float(pad_right_ratio)))
+    )
+    resolved_top = (
+        _float_env("NAME_SEARCH_CARD_PAD_TOP", 0.12, minimum=0.0, maximum=0.2)
+        if pad_top_ratio is None
+        else max(0.0, min(0.2, float(pad_top_ratio)))
+    )
+    resolved_bottom = (
+        _float_env("NAME_SEARCH_CARD_PAD_BOTTOM", 0.05, minimum=0.0, maximum=0.2)
+        if pad_bottom_ratio is None
+        else max(0.0, min(0.2, float(pad_bottom_ratio)))
+    )
+    resolved_extra_top = max(0.0, min(0.25, float(extra_top_ratio)))
+
     x1, y1, x2, y2 = box
     box_width = max(1, x2 - x1)
     box_height = max(1, y2 - y1)
-    expanded_x1 = max(0, int(round(x1 - (box_width * pad_left_ratio))))
-    expanded_x2 = min(width, int(round(x2 + (box_width * pad_right_ratio))))
-    expanded_y1 = max(0, int(round(y1 - (box_height * pad_top_ratio))))
-    expanded_y2 = min(height, int(round(y2 + (box_height * pad_bottom_ratio))))
+    expanded_x1 = max(0, int(round(x1 - (box_width * resolved_left))))
+    expanded_x2 = min(width, int(round(x2 + (box_width * resolved_right))))
+    expanded_y1 = max(0, int(round(y1 - (box_height * (resolved_top + resolved_extra_top)))))
+    expanded_y2 = min(height, int(round(y2 + (box_height * resolved_bottom))))
     return expanded_x1, expanded_y1, expanded_x2, expanded_y2
 
 
@@ -1053,12 +1160,198 @@ def _detect_voter_card_boxes(page_image) -> tuple[list[tuple[int, int, int, int]
     candidate_boxes = _dedupe_boxes(candidate_boxes)
 
     if 12 <= len(candidate_boxes) <= 42:
-        expanded_boxes = [
-            _expand_box(box, width=width, height=height)
-            for box in candidate_boxes
-        ]
-        return expanded_boxes, "opencv_layout", None
+        return candidate_boxes, "opencv_layout", None
     return fallback_boxes, "grid_fallback", "opencv detected unstable card layout; using grid fallback"
+
+
+def _group_numeric_values(values: Sequence[float], threshold: float) -> list[list[float]]:
+    if not values:
+        return []
+    sorted_values = sorted(float(value) for value in values)
+    groups: list[list[float]] = []
+    for value in sorted_values:
+        if not groups:
+            groups.append([value])
+            continue
+        if abs(value - groups[-1][-1]) <= threshold:
+            groups[-1].append(value)
+        else:
+            groups.append([value])
+    return groups
+
+
+def _estimate_template_rows(support_boxes: Sequence[tuple[int, int, int, int]]) -> int:
+    default_rows = int(round(_float_env("NAME_SEARCH_SLOT_ROWS", 10, minimum=8, maximum=12)))
+    if not support_boxes:
+        return default_rows
+    heights = [max(1, box[3] - box[1]) for box in support_boxes]
+    median_height = float(median(heights))
+    y_centers = [((box[1] + box[3]) / 2.0) for box in support_boxes]
+    grouped_rows = _group_numeric_values(y_centers, threshold=max(8.0, median_height * 0.55))
+    estimated_rows = len(grouped_rows)
+    if estimated_rows < 6:
+        return default_rows
+    return max(default_rows, min(12, estimated_rows))
+
+
+def _derive_template_slot_boxes(
+    *,
+    width: int,
+    height: int,
+    support_boxes: Sequence[tuple[int, int, int, int]],
+) -> tuple[list[tuple[int, int, int, int]], dict[str, Any]]:
+    cols = 3
+    default_rows = int(round(_float_env("NAME_SEARCH_SLOT_ROWS", 10, minimum=8, maximum=12)))
+    default_margin_x = int(width * 0.03)
+    default_top = int(height * 0.18)
+    default_bottom = int(height * 0.03)
+
+    if not support_boxes:
+        rows = default_rows
+        gap_x = max(4, int(width * 0.008))
+        gap_y = max(4, int(height * 0.006))
+        region_x1 = default_margin_x
+        region_x2 = width - default_margin_x
+        region_y1 = default_top
+        region_y2 = height - default_bottom
+        region_width = max(10, region_x2 - region_x1)
+        region_height = max(10, region_y2 - region_y1)
+        slot_width = max(10, int((region_width - (gap_x * (cols - 1))) / cols))
+        slot_height = max(10, int((region_height - (gap_y * (rows - 1))) / rows))
+        slot_boxes: list[tuple[int, int, int, int]] = []
+        for row_index in range(rows):
+            slot_y1 = region_y1 + row_index * (slot_height + gap_y)
+            slot_y2 = min(height, slot_y1 + slot_height)
+            for col_index in range(cols):
+                slot_x1 = region_x1 + col_index * (slot_width + gap_x)
+                slot_x2 = min(width, slot_x1 + slot_width)
+                slot_boxes.append((int(slot_x1), int(slot_y1), int(slot_x2), int(slot_y2)))
+        template_meta = {
+            "columns": cols,
+            "rows": rows,
+            "support_row_count": 0,
+            "region_bbox": {"x1": int(region_x1), "y1": int(region_y1), "x2": int(region_x2), "y2": int(region_y2)},
+            "slot_width": int(slot_width),
+            "slot_height": int(slot_height),
+            "gap_x": int(gap_x),
+            "gap_y": int(gap_y),
+            "source": "grid_fallback",
+        }
+        return slot_boxes, template_meta
+
+    support_x1 = min(box[0] for box in support_boxes)
+    support_x2 = max(box[2] for box in support_boxes)
+    support_heights = [max(1, box[3] - box[1]) for box in support_boxes]
+    median_support_height = float(median(support_heights))
+
+    # Build deterministic column spans using clustered support-box centers.
+    center_x_values = [((box[0] + box[2]) / 2.0) for box in support_boxes]
+    column_centers = _kmeans_1d(center_x_values, cluster_count=cols)
+    if len(column_centers) < cols:
+        step = max(20.0, float(width - (2 * default_margin_x)) / cols)
+        column_centers = [default_margin_x + (step * (index + 0.5)) for index in range(cols)]
+    column_centers = sorted(column_centers[:cols])
+
+    columns: list[list[tuple[int, int, int, int]]] = [[] for _ in range(cols)]
+    for box in support_boxes:
+        center_x = (box[0] + box[2]) / 2.0
+        nearest_col = min(range(cols), key=lambda idx: abs(center_x - column_centers[idx]))
+        columns[nearest_col].append(box)
+
+    column_spans: list[tuple[int, int]] = []
+    support_span_width = max(10, support_x2 - support_x1)
+    fallback_column_width = max(10, int(round(support_span_width / cols)))
+    for col_index in range(cols):
+        column_boxes = columns[col_index]
+        if column_boxes:
+            column_x1 = int(round(median([box[0] for box in column_boxes])))
+            column_x2 = int(round(median([box[2] for box in column_boxes])))
+        else:
+            column_x1 = support_x1 + (col_index * fallback_column_width)
+            column_x2 = column_x1 + fallback_column_width
+        column_x1 = max(0, min(width - 1, column_x1))
+        column_x2 = max(column_x1 + 10, min(width, column_x2))
+        column_spans.append((column_x1, column_x2))
+    column_spans.sort(key=lambda span: span[0])
+
+    # Derive row starts from support boxes. If OCR/contours miss the top row,
+    # extrapolate one row upward using the observed row pitch.
+    row_groups = _group_numeric_values(
+        [float(box[1]) for box in support_boxes],
+        threshold=max(6.0, median_support_height * 0.35),
+    )
+    row_starts = sorted({int(round(median(group))) for group in row_groups if group})
+    support_row_count = len(row_starts)
+
+    if len(row_starts) >= 2:
+        row_diffs = [row_starts[index + 1] - row_starts[index] for index in range(len(row_starts) - 1)]
+        row_pitch = int(round(median(row_diffs)))
+    else:
+        row_pitch = int(round(median_support_height + max(4.0, median_support_height * 0.04)))
+    row_pitch = max(20, row_pitch)
+
+    target_rows = max(default_rows, support_row_count)
+    if not row_starts:
+        row_starts = [default_top + (index * row_pitch) for index in range(target_rows)]
+    elif len(row_starts) < target_rows:
+        missing_rows = target_rows - len(row_starts)
+        while missing_rows > 0 and row_starts and (row_starts[0] - row_pitch) >= int(height * 0.03):
+            row_starts.insert(0, row_starts[0] - row_pitch)
+            missing_rows -= 1
+        while missing_rows > 0:
+            row_starts.append(row_starts[-1] + row_pitch)
+            missing_rows -= 1
+    elif len(row_starts) > target_rows:
+        row_starts = row_starts[:target_rows]
+
+    row_height = int(round(median_support_height))
+    if len(row_starts) >= 2:
+        row_height = min(row_height, max(10, row_pitch - 4))
+    row_height = max(10, row_height)
+
+    slot_boxes: list[tuple[int, int, int, int]] = []
+    for row_index, slot_y1_raw in enumerate(row_starts):
+        slot_y1 = max(0, int(slot_y1_raw))
+        slot_y2 = min(height, int(slot_y1 + row_height))
+        if slot_y2 <= slot_y1:
+            continue
+        for column_x1, column_x2 in column_spans:
+            slot_x1 = max(0, int(column_x1))
+            slot_x2 = min(width, int(column_x2))
+            if slot_x2 <= slot_x1:
+                continue
+            slot_boxes.append((slot_x1, slot_y1, slot_x2, slot_y2))
+
+    if not slot_boxes:
+        return _build_grid_card_boxes(width, height), {
+            "columns": cols,
+            "rows": default_rows,
+            "support_row_count": support_row_count,
+            "region_bbox": {"x1": int(default_margin_x), "y1": int(default_top), "x2": int(width - default_margin_x), "y2": int(height - default_bottom)},
+            "slot_width": int(round((width - (2 * default_margin_x)) / cols)),
+            "slot_height": int(round((height - default_top - default_bottom) / max(default_rows, 1))),
+            "gap_x": 0,
+            "gap_y": 0,
+            "source": "grid_fallback_empty_template",
+        }
+
+    slot_boxes.sort(key=lambda box: (box[1], box[0]))
+    region_x1 = min(box[0] for box in slot_boxes)
+    region_y1 = min(box[1] for box in slot_boxes)
+    region_x2 = max(box[2] for box in slot_boxes)
+    region_y2 = max(box[3] for box in slot_boxes)
+    template_meta = {
+        "columns": cols,
+        "rows": int(len(slot_boxes) / cols) if cols > 0 else 0,
+        "support_row_count": support_row_count,
+        "region_bbox": {"x1": int(region_x1), "y1": int(region_y1), "x2": int(region_x2), "y2": int(region_y2)},
+        "slot_width": int(round(median([box[2] - box[0] for box in slot_boxes]))),
+        "slot_height": int(round(median([box[3] - box[1] for box in slot_boxes]))),
+        "gap_x": int(round(median([column_spans[index + 1][0] - column_spans[index][1] for index in range(len(column_spans) - 1)]))) if len(column_spans) > 1 else 0,
+        "gap_y": int(row_pitch),
+        "source": "support_aligned_template",
+    }
+    return slot_boxes, template_meta
 
 
 def _preprocess_card_for_ocr(card_image):
@@ -1173,6 +1466,188 @@ def _ocr_card_image(card_image, timeout_seconds: float | None) -> tuple[str, str
     return text, None, ocr_meta
 
 
+def _ocr_digits_from_image(card_image, timeout_seconds: float | None) -> tuple[str, str | None, str]:
+    try:
+        import pytesseract
+    except Exception as exc:  # noqa: BLE001
+        return "", f"pytesseract import failed: {exc}", "none"
+
+    tesseract_path = shutil.which("tesseract")
+    if not tesseract_path:
+        return "", "tesseract command not found", "none"
+
+    try:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_path
+    except Exception:  # noqa: BLE001
+        pass
+
+    preprocessed_image, preprocess_note = _preprocess_card_for_ocr(card_image)
+    digit_configs = [
+        "--oem 1 --psm 7 -c tessedit_char_whitelist=0123456789",
+        "--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789",
+    ]
+    digit_errors: list[str] = []
+    for config in digit_configs:
+        try:
+            digit_text = _run_tesseract(preprocessed_image, timeout_seconds=timeout_seconds, config=config)
+            digits_only = re.sub(r"\D", "", str(digit_text or ""))
+            if digits_only:
+                return digits_only, None, preprocess_note
+        except RuntimeError as exc:
+            digit_errors.append(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            digit_errors.append(str(exc))
+    if digit_errors:
+        return "", f"digit-ocr failed: {digit_errors[0]}", preprocess_note
+    return "", None, preprocess_note
+
+
+def _ocr_id_from_image(card_image, timeout_seconds: float | None) -> tuple[str, str | None, str]:
+    try:
+        import pytesseract
+    except Exception as exc:  # noqa: BLE001
+        return "", f"pytesseract import failed: {exc}", "none"
+
+    tesseract_path = shutil.which("tesseract")
+    if not tesseract_path:
+        return "", "tesseract command not found", "none"
+
+    try:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_path
+    except Exception:  # noqa: BLE001
+        pass
+
+    preprocessed_image, preprocess_note = _preprocess_card_for_ocr(card_image)
+    id_configs = [
+        "--oem 1 --psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/",
+        "--oem 1 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/",
+    ]
+    id_errors: list[str] = []
+    for config in id_configs:
+        try:
+            id_text = _run_tesseract(preprocessed_image, timeout_seconds=timeout_seconds, config=config)
+            cleaned = re.sub(r"[^A-Za-z0-9/\\-]+", "", str(id_text or "").upper())
+            if cleaned:
+                return cleaned, None, preprocess_note
+        except RuntimeError as exc:
+            id_errors.append(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            id_errors.append(str(exc))
+    if id_errors:
+        return "", f"id-ocr failed: {id_errors[0]}", preprocess_note
+    return "", None, preprocess_note
+
+
+def _split_card_zones(card_image):
+    width, height = card_image.size
+    if width <= 2 or height <= 2:
+        return {
+            "serial": card_image,
+            "elector_id": card_image,
+            "body": card_image,
+            "zone_bboxes": {
+                "serial": (0, 0, width, height),
+                "elector_id": (0, 0, width, height),
+                "body": (0, 0, width, height),
+            },
+        }
+
+    top_height = max(10, int(round(height * 0.30)))
+    serial_split_x = max(8, int(round(width * 0.44)))
+    body_start_y = max(1, int(round(height * 0.16)))
+    # Exclude the right-side photo area from body OCR for this fixed electoral-roll card format.
+    body_end_x = max(int(width * 0.60), int(round(width * 0.78)))
+
+    serial_bbox = (0, 0, serial_split_x, top_height)
+    elector_bbox = (max(0, serial_split_x - int(width * 0.03)), 0, width, top_height)
+    body_bbox = (0, body_start_y, min(width, body_end_x), height)
+
+    return {
+        "serial": card_image.crop(serial_bbox),
+        "elector_id": card_image.crop(elector_bbox),
+        "body": card_image.crop(body_bbox),
+        "zone_bboxes": {
+            "serial": serial_bbox,
+            "elector_id": elector_bbox,
+            "body": body_bbox,
+        },
+    }
+
+
+def _ocr_card_zones(card_image, timeout_seconds: float | None) -> dict[str, Any]:
+    zones_payload = _split_card_zones(card_image)
+    serial_text, serial_error, serial_meta = _ocr_card_image(zones_payload["serial"], timeout_seconds=timeout_seconds)
+    serial_digits_text, serial_digits_error, serial_digits_preprocess = _ocr_digits_from_image(
+        zones_payload["serial"],
+        timeout_seconds=timeout_seconds,
+    )
+    elector_text, elector_error, elector_meta = _ocr_card_image(zones_payload["elector_id"], timeout_seconds=timeout_seconds)
+    card_width, card_height = card_image.size
+    top_micro_height = max(10, int(round(card_height * 0.22)))
+    serial_micro_bbox = (
+        max(0, int(round(card_width * 0.18))),
+        0,
+        min(card_width, int(round(card_width * 0.52))),
+        min(card_height, top_micro_height),
+    )
+    elector_micro_bbox = (
+        max(0, int(round(card_width * 0.45))),
+        0,
+        card_width,
+        min(card_height, top_micro_height),
+    )
+    serial_micro_image = card_image.crop(serial_micro_bbox)
+    elector_micro_image = card_image.crop(elector_micro_bbox)
+    serial_verify_text, serial_verify_error, serial_verify_preprocess = _ocr_digits_from_image(
+        serial_micro_image,
+        timeout_seconds=timeout_seconds,
+    )
+    elector_verify_text, elector_verify_error, elector_verify_preprocess = _ocr_id_from_image(
+        elector_micro_image,
+        timeout_seconds=timeout_seconds,
+    )
+    body_text, body_error, body_meta = _ocr_card_image(zones_payload["body"], timeout_seconds=timeout_seconds)
+
+    combined_text = "\n".join(
+        [
+            str(serial_text or "").strip(),
+            str(elector_text or "").strip(),
+            str(body_text or "").strip(),
+        ]
+    ).strip()
+    combined_errors = [error for error in [serial_error, elector_error, body_error] if error]
+
+    return {
+        "combined_text": combined_text,
+        "combined_error": "; ".join(combined_errors) if combined_errors else None,
+        "serial_text": str(serial_text or "").strip(),
+        "serial_digits_text": str(serial_digits_text or "").strip(),
+        "serial_verify_text": str(serial_verify_text or "").strip(),
+        "elector_text": str(elector_text or "").strip(),
+        "elector_verify_text": str(elector_verify_text or "").strip(),
+        "body_text": str(body_text or "").strip(),
+        "serial_error": serial_error,
+        "serial_digits_error": serial_digits_error,
+        "serial_verify_error": serial_verify_error,
+        "elector_error": elector_error,
+        "elector_verify_error": elector_verify_error,
+        "body_error": body_error,
+        "zone_bboxes": {
+            **(zones_payload.get("zone_bboxes") or {}),
+            "serial_micro": serial_micro_bbox,
+            "elector_micro": elector_micro_bbox,
+        },
+        "preprocess": {
+            "serial": (serial_meta or {}).get("preprocess"),
+            "serial_digits": serial_digits_preprocess,
+            "serial_verify": serial_verify_preprocess,
+            "elector_id": (elector_meta or {}).get("preprocess"),
+            "elector_verify": elector_verify_preprocess,
+            "body": (body_meta or {}).get("preprocess"),
+        },
+    }
+
+
 def _clean_card_field(raw_value: str) -> str:
     cleaned = re.sub(r"\s+", " ", str(raw_value or "")).strip()
     cleaned = re.sub(r"^[^A-Za-z0-9]+", "", cleaned)
@@ -1187,7 +1662,12 @@ def _clean_card_field(raw_value: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     )
-    cleaned = cleaned.strip(" :|-.,")
+    cleaned = cleaned.replace("[", " ").replace("]", " ")
+    cleaned = cleaned.replace("(", " ").replace(")", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" :|-.,;")
+    cleaned = re.sub(r"[^A-Za-z0-9/\-.' ]+$", "", cleaned).strip(" :|-.,;")
+    if _is_junk_field_value(cleaned):
+        return ""
     return cleaned[:160]
 
 
@@ -1223,6 +1703,92 @@ def _clean_card_ocr_text(raw_text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned_lines)).strip()
 
 
+def _normalize_card_label_variants(cleaned_text: str) -> tuple[str, list[str]]:
+    normalized_text = str(cleaned_text or "")
+    if not normalized_text:
+        return "", []
+
+    replacements: list[tuple[str, str, str]] = [
+        (r"(?im)\bfath(?:er|ore|ere|or|ar|ers?)\s+(?:name|narne|nane)\b", "Fathers Name", "Fathers Name"),
+        (r"(?im)\bhusb(?:and|ands|end|ends|an|ens?)\s+(?:name|narne|nane)\b", "Husbands Name", "Husbands Name"),
+        (r"(?im)\bmoth(?:er|ers?|ore|ere)\s+(?:name|narne|nane)\b", "Mothers Name", "Mothers Name"),
+        (r"(?im)\b(?:ags|aqe|agc|ago|ag)\b", "Age", "Age"),
+        (r"(?im)\b(?:gonder|gendor|gendor|gendar)\b", "Gender", "Gender"),
+    ]
+    normalized_labels: set[str] = set()
+    for pattern, canonical_text, canonical_label in replacements:
+        if re.search(pattern, normalized_text):
+            normalized_text = re.sub(pattern, canonical_text, normalized_text)
+            normalized_labels.add(canonical_label)
+    return normalized_text, sorted(normalized_labels)
+
+
+def _normalize_gender_token(raw_gender: str) -> str:
+    token = re.sub(r"[^a-z]", "", str(raw_gender or "").lower())
+    if not token:
+        return ""
+    if token in {"m", "male"} or token.startswith("mal"):
+        return "male"
+    if token in {"f", "female"} or token.startswith("fem"):
+        return "female"
+    if token.startswith("oth"):
+        return "other"
+    return ""
+
+
+def _is_valid_elector_id(value: str) -> bool:
+    normalized = str(value or "").strip().upper()
+    if not normalized:
+        return False
+    return bool(
+        re.fullmatch(r"[A-Z]{3}\d{6,12}", normalized)
+        or re.fullmatch(r"[A-Z]{2}/\d{1,4}/\d{1,4}/\d{3,10}", normalized)
+    )
+
+
+def _is_junk_field_value(value: str) -> bool:
+    normalized = str(value or "").strip().strip(" .:-|").lower()
+    if not normalized:
+        return True
+    if normalized in {
+        "available",
+        "photo",
+        "number",
+        "null",
+        "none",
+        "na",
+        "n/a",
+        "nil",
+    }:
+        return True
+    if re.fullmatch(r"v\d+", normalized):
+        return True
+    return False
+
+
+def _extract_labeled_value_strict(cleaned_text: str, label_patterns: Sequence[str]) -> str:
+    lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        for label_pattern in label_patterns:
+            match = re.search(
+                rf"(?i)^\s*{label_pattern}\b\s*(?:[:\-|]\s*|\s+)(.*)$",
+                line,
+            )
+            if not match:
+                continue
+            immediate_value = _clean_card_field(match.group(1))
+            if immediate_value and not _is_junk_field_value(immediate_value):
+                return immediate_value
+            if index + 1 < len(lines):
+                next_line = lines[index + 1]
+                if ":" in next_line:
+                    continue
+                next_value = _clean_card_field(next_line)
+                if next_value and not _is_junk_field_value(next_value):
+                    return next_value
+    return ""
+
+
 def _extract_labeled_value(cleaned_text: str, label_patterns: Sequence[str]) -> str:
     lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
     for index, line in enumerate(lines):
@@ -1243,7 +1809,7 @@ def _extract_labeled_value(cleaned_text: str, label_patterns: Sequence[str]) -> 
     return ""
 
 
-def _parse_serial_number(cleaned_text: str) -> str:
+def _parse_serial_number(cleaned_text: str, *, allow_loose: bool = False) -> str:
     labeled_serial = _extract_labeled_value(
         cleaned_text,
         [r"serial", r"sl\.?\s*no\.?", r"sr\.?\s*no\.?", r"क्रमांक"],
@@ -1264,40 +1830,128 @@ def _parse_serial_number(cleaned_text: str) -> str:
         if serial_with_epic:
             return serial_with_epic.group(1)
 
-    if lines:
+    for line in lines:
+        if re.fullmatch(r"\d{1,4}", line):
+            return line
+    if allow_loose and lines:
         first_line_match = re.match(r"^(\d{1,5})\b", lines[0])
         if first_line_match:
             return first_line_match.group(1)
-    for line in lines:
-        if re.fullmatch(r"\d{1,5}", line):
-            return line
     return ""
 
 
 def _parse_elector_id(cleaned_text: str) -> str:
+    digit_to_letter = str.maketrans(
+        {
+            "0": "O",
+            "1": "I",
+            "5": "S",
+            "6": "G",
+            "8": "B",
+        }
+    )
+    letter_to_digit = str.maketrans(
+        {
+            "O": "0",
+            "Q": "0",
+            "I": "1",
+            "L": "1",
+            "S": "5",
+            "B": "8",
+        }
+    )
+
+    def normalize_candidate(raw_candidate: str) -> str:
+        candidate = str(raw_candidate or "").upper()
+        candidate = candidate.replace("\\", "/").replace("|", "/")
+        candidate = re.sub(r"\s+", "", candidate)
+        candidate = re.sub(r"/{2,}", "/", candidate)
+        candidate = re.sub(r"-{2,}", "-", candidate)
+
+        if "/" in candidate:
+            parts = [segment for segment in candidate.split("/") if segment]
+            if len(parts) < 4:
+                return ""
+            prefix = re.sub(r"[^A-Z0-9]", "", parts[0]).translate(digit_to_letter)
+            if prefix == "W":
+                prefix = "WB"
+            if prefix.startswith("WB"):
+                prefix = "WB"
+            if len(prefix) != 2:
+                prefix = prefix[:2]
+            if len(prefix) != 2 or not prefix.isalpha():
+                return ""
+
+            numeric_parts: list[str] = []
+            for segment in parts[1:4]:
+                normalized_segment = re.sub(r"[^A-Z0-9]", "", segment).translate(letter_to_digit)
+                normalized_segment = re.sub(r"\D", "", normalized_segment)
+                if not normalized_segment:
+                    return ""
+                numeric_parts.append(normalized_segment)
+            return "/".join([prefix, numeric_parts[0], numeric_parts[1], numeric_parts[2]])
+
+        compact_candidate = re.sub(r"[^A-Z0-9]", "", candidate)
+        if not compact_candidate:
+            return ""
+
+        # Prefer classic EPIC form (3-letter prefix + digits), but tolerate OCR drift.
+        def normalize_compact_parts(prefix_raw: str, suffix_raw: str) -> str:
+            prefix = str(prefix_raw or "").translate(digit_to_letter)
+            suffix = str(suffix_raw or "")
+            if len(prefix) == 2 and suffix and suffix[0] in "OILSB":
+                # Recover dropped 3rd prefix char, e.g. "AR" + "O2700045" => "ARO2700045".
+                prefix = (prefix + suffix[0]).translate(digit_to_letter)
+                suffix = suffix[1:]
+            if len(prefix) == 4 and prefix.endswith(("I", "L")) and prefix[:3].isalpha():
+                prefix = prefix[:3]
+            if prefix.startswith("BGNI"):
+                prefix = "BGN"
+            if len(prefix) > 3:
+                prefix = "BGN" if prefix.startswith("BGN") else prefix[:3]
+            if len(prefix) != 3 or not prefix.isalpha():
+                return ""
+            numeric_suffix = suffix.translate(letter_to_digit)
+            numeric_suffix = re.sub(r"\D", "", numeric_suffix)
+            if len(numeric_suffix) < 6:
+                return ""
+            return prefix + numeric_suffix
+
+        compact_patterns = [
+            r"([A-Z0-9]{3})([0-9OILSB]{6,12})",
+            r"([A-Z0-9]{4})([0-9OILSB]{6,12})",
+            r"([A-Z0-9]{2})([0-9OILSB]{7,13})",
+        ]
+        for compact_pattern in compact_patterns:
+            for compact_match in re.finditer(compact_pattern, compact_candidate):
+                normalized_compact = normalize_compact_parts(
+                    compact_match.group(1),
+                    compact_match.group(2),
+                )
+                if _is_valid_elector_id(normalized_compact):
+                    return normalized_compact
+        return ""
+
     labeled_id = _extract_labeled_value(
         cleaned_text,
         [r"epic", r"elector\s*id", r"voter\s*id", r"id\s*no\.?", r"card\s*no\.?"],
     )
     if labeled_id:
-        normalized_labeled = re.sub(r"\s+", "", labeled_id.upper())
-        if re.fullmatch(r"(?:[A-Z]{2,4}\d{6,10}|[A-Z]{1,3}/\d{1,3}/\d{1,3}/\d{3,8}|[A-Z]{1,4}[-/]\d{6,10})", normalized_labeled):
+        normalized_labeled = normalize_candidate(labeled_id)
+        if _is_valid_elector_id(normalized_labeled):
             return normalized_labeled
 
     upper_text = cleaned_text.upper()
     patterns = [
-        r"([A-Z]{2,4}\s*\d{6,10})",
-        r"([A-Z]{1,3}\s*/\s*\d{1,3}\s*/\s*\d{1,3}\s*/\s*\d{3,8})",
-        r"([A-Z]{1,4}\s*[-/]\s*\d{6,10})",
+        r"([A-Z0-9]{2,5}\s*(?:[0-9OILSB]\s*){6,12})",
+        r"([A-Z0-9]{1,3}\s*/\s*[A-Z0-9]{1,4}\s*/\s*[A-Z0-9]{1,4}\s*/\s*[A-Z0-9]{2,10})",
+        r"([A-Z0-9]{1,3}\s*[-/]\s*[A-Z0-9]{5,12})",
     ]
     for pattern in patterns:
         for match in re.finditer(pattern, upper_text):
             candidate = match.group(1)
-            normalized = re.sub(r"\s+", "", candidate)
-            normalized = re.sub(r"\s*/\s*", "/", normalized)
-            normalized = re.sub(r"\s*-\s*", "-", normalized)
-            digit_count = sum(char.isdigit() for char in normalized)
-            if digit_count >= 6:
+            normalized = normalize_candidate(candidate)
+            if _is_valid_elector_id(normalized):
                 return normalized
     return ""
 
@@ -1457,21 +2111,53 @@ def _infer_card_name(cleaned_text: str, elector_id: str) -> str:
     return ""
 
 
-def _classify_card_record(record: dict[str, Any]) -> tuple[str, str]:
+def _missing_fields_for_record(record: dict[str, Any]) -> list[str]:
+    checks = [
+        ("serial_number", str(record.get("serial_number") or "").strip()),
+        ("elector_id", str(record.get("elector_id") or "").strip()),
+        ("name", str(record.get("name") or "").strip()),
+        ("relative_type", str(record.get("relative_type") or "").strip()),
+        ("relative_name", str(record.get("relative_name") or "").strip()),
+        ("house_number", str(record.get("house_number") or "").strip()),
+        ("age", record.get("age")),
+        ("gender", str(record.get("gender") or "").strip()),
+    ]
+    missing: list[str] = []
+    for field_name, value in checks:
+        if value is None:
+            missing.append(field_name)
+            continue
+        if isinstance(value, str) and not value.strip():
+            missing.append(field_name)
+    return missing
+
+
+def _parse_status_rank(parse_status: str) -> int:
+    if parse_status == "valid":
+        return 3
+    if parse_status == "partial_field_missing":
+        return 2
+    if parse_status == "partial_top_missing":
+        return 1
+    return 0
+
+
+def _classify_card_record(record: dict[str, Any], *, body_has_lower_signals: bool) -> tuple[str, str]:
     name_value = str(record.get("name") or "").strip()
-    if not name_value or _is_noise_name(name_value):
-        return "rejected", "invalid/noisy name"
+    if not name_value:
+        if body_has_lower_signals:
+            return "partial_top_missing", "name missing but lower fields present"
+        return "rejected_noise", "name missing"
+    if _is_noise_name(name_value):
+        return "rejected_noise", "invalid/noisy name"
 
     elector_id_value = str(record.get("elector_id") or "").strip()
-    if elector_id_value and not re.fullmatch(
-        r"(?:[A-Z]{2,4}\d{6,10}|[A-Z]{1,3}/\d{1,3}/\d{1,3}/\d{3,8}|[A-Z]{1,4}[-/]\d{6,10})",
-        elector_id_value,
-    ):
-        return "rejected", "invalid elector_id format"
+    if elector_id_value and not _is_valid_elector_id(elector_id_value):
+        return "rejected_noise", "invalid elector_id format"
 
     serial_number_value = str(record.get("serial_number") or "").strip()
     if serial_number_value and not re.fullmatch(r"\d{1,5}", serial_number_value):
-        return "rejected", "invalid serial_number format"
+        return "rejected_noise", "invalid serial_number format"
 
     primary_fields_present = sum(
         [
@@ -1488,53 +2174,382 @@ def _classify_card_record(record: dict[str, Any]) -> tuple[str, str]:
         ]
     )
 
-    if primary_fields_present >= 2:
+    if primary_fields_present >= 3:
         return "valid", ""
+    if primary_fields_present >= 2 and (elector_id_value or serial_number_value):
+        return "valid", ""
+    if not elector_id_value and not serial_number_value and primary_fields_present >= 1:
+        return "partial_top_missing", "serial/elector missing"
     if primary_fields_present >= 1:
-        return "partial", "missing some key fields"
+        return "partial_field_missing", "missing some key fields"
     if secondary_fields_present >= 1:
-        return "partial", "only secondary fields parsed"
-    return "rejected", "missing minimum identity fields"
+        if body_has_lower_signals:
+            return "partial_top_missing", "top fields missing"
+        return "partial_field_missing", "only secondary fields parsed"
+    return "rejected_noise", "missing minimum identity fields"
+
+
+def _classify_serial_confidence(
+    *,
+    serial_number: str,
+    parse_quality: str,
+    slot_index: int | None,
+    expected_slots: int | None,
+    serial_pass_a_text: str,
+    serial_pass_b_text: str,
+) -> tuple[str, str]:
+    normalized = str(serial_number or "").strip()
+    if not normalized:
+        return "needs_review", "serial missing"
+    if not re.fullmatch(r"\d{1,5}", normalized):
+        return "needs_review", "serial invalid format"
+
+    serial_int = int(normalized)
+    if serial_int <= 0:
+        return "needs_review", "serial must be positive"
+
+    pass_a = re.sub(r"\D", "", str(serial_pass_a_text or "")).lstrip("0")
+    pass_b = re.sub(r"\D", "", str(serial_pass_b_text or "")).lstrip("0")
+    value_no_zero = normalized.lstrip("0") or normalized
+
+    dual_pass_agree = bool(pass_a and pass_b and pass_a == pass_b == value_no_zero)
+    any_pass_match = bool((pass_a and pass_a == value_no_zero) or (pass_b and pass_b == value_no_zero))
+
+    local_range_ok = True
+    if expected_slots is not None and int(expected_slots) > 0:
+        max_expected = max(int(expected_slots) + 5, int(expected_slots) * 2)
+        local_range_ok = 1 <= serial_int <= max_expected
+    if not local_range_ok:
+        return "needs_review", "serial out of expected local range"
+
+    order_close = True
+    slot_exact = False
+    if slot_index is not None and int(slot_index) > 0:
+        slot_exact = serial_int == int(slot_index)
+        order_close = abs(serial_int - int(slot_index)) <= 1
+
+    strong_quality = parse_quality in {
+        "direct_zone_match",
+        "direct_strong_match",
+        "normalized_fuzzy_match",
+    }
+
+    if parse_quality in {"direct_strong_match", "direct_zone_match"} and (dual_pass_agree or (any_pass_match and order_close)):
+        return "trusted", "serial verified by zone/micro pass"
+    if dual_pass_agree and order_close:
+        return "trusted", "serial verified by dual-pass agreement"
+    if slot_exact and strong_quality:
+        return "trusted", "serial aligned with slot order"
+    if any_pass_match and order_close and strong_quality:
+        return "trusted", "serial matched in one focused OCR pass"
+    if any_pass_match or order_close:
+        return "low_confidence", "serial weak agreement"
+    return "needs_review", "serial mismatch across passes"
+
+
+def _classify_elector_confidence(
+    *,
+    elector_id: str,
+    parse_quality: str,
+    elector_pass_a_text: str,
+    elector_pass_b_text: str,
+) -> tuple[str, str]:
+    normalized = str(elector_id or "").strip().upper()
+    if not normalized:
+        return "needs_review", "elector_id missing"
+    if not _is_valid_elector_id(normalized):
+        return "needs_review", "elector_id invalid format"
+
+    pass_a = _parse_elector_id(_clean_card_ocr_text(elector_pass_a_text))
+    pass_b = _parse_elector_id(_clean_card_ocr_text(elector_pass_b_text))
+    dual_pass_agree = bool(pass_a and pass_b and pass_a == pass_b == normalized)
+    any_pass_match = bool((pass_a and pass_a == normalized) or (pass_b and pass_b == normalized))
+
+    if dual_pass_agree:
+        return "trusted", "elector_id verified by dual-pass agreement"
+    if parse_quality == "direct_zone_match" and any_pass_match:
+        return "trusted", "elector_id verified in zone pass"
+    if any_pass_match:
+        return "low_confidence", "elector_id verified in one pass"
+    if pass_a and pass_b and pass_a != pass_b:
+        return "needs_review", "elector_id pass disagreement"
+    return "low_confidence", "elector_id single-source parse"
 
 
 def _parse_card_record(
     *,
     raw_card_text: str,
     cleaned_card_text: str,
+    serial_zone_text: str,
+    serial_zone_digits_text: str,
+    serial_zone_verify_text: str,
+    elector_zone_text: str,
+    elector_zone_verify_text: str,
+    body_zone_text: str,
     file_name: str,
     file_path: str,
     page_number: int,
     constituency: str | None,
     section_name: str | None,
     extraction_method: str,
-) -> tuple[dict[str, Any] | None, str, str | None]:
-    if not cleaned_card_text.strip():
-        return None, "rejected", "empty card text after cleanup"
+    slot_index: int | None = None,
+    expected_slots: int | None = None,
+) -> tuple[dict[str, Any] | None, str, str | None, list[str], dict[str, Any]]:
+    cleaned_serial_zone = _clean_card_ocr_text(serial_zone_text)
+    cleaned_serial_verify_zone = _clean_card_ocr_text(serial_zone_verify_text)
+    cleaned_elector_zone = _clean_card_ocr_text(elector_zone_text)
+    cleaned_elector_verify_zone = _clean_card_ocr_text(elector_zone_verify_text)
+    cleaned_body_zone = _clean_card_ocr_text(body_zone_text)
+    normalized_labels_detected: set[str] = set()
+    cleaned_serial_zone, serial_labels = _normalize_card_label_variants(cleaned_serial_zone)
+    cleaned_serial_verify_zone, serial_verify_labels = _normalize_card_label_variants(cleaned_serial_verify_zone)
+    cleaned_elector_zone, elector_labels = _normalize_card_label_variants(cleaned_elector_zone)
+    cleaned_elector_verify_zone, elector_verify_labels = _normalize_card_label_variants(cleaned_elector_verify_zone)
+    cleaned_body_zone, body_labels = _normalize_card_label_variants(cleaned_body_zone)
+    normalized_labels_detected.update(serial_labels)
+    normalized_labels_detected.update(serial_verify_labels)
+    normalized_labels_detected.update(elector_labels)
+    normalized_labels_detected.update(elector_verify_labels)
+    normalized_labels_detected.update(body_labels)
 
-    serial_number = _parse_serial_number(cleaned_card_text)
-    elector_id = _parse_elector_id(cleaned_card_text)
-    name = _extract_labeled_value(
-        cleaned_card_text,
+    parse_meta: dict[str, Any] = {
+        "field_parse_quality": {},
+        "normalized_labels_detected": sorted(normalized_labels_detected),
+        "serial_candidates": [],
+        "elector_candidates": [],
+        "serial_ocr_pass_a_raw": str(serial_zone_text or ""),
+        "serial_ocr_pass_b_raw": str(serial_zone_verify_text or ""),
+        "elector_ocr_pass_a_raw": str(elector_zone_text or ""),
+        "elector_ocr_pass_b_raw": str(elector_zone_verify_text or ""),
+        "serial_number_cleaned": None,
+        "elector_id_cleaned": None,
+        "serial_confidence": "needs_review",
+        "elector_confidence": "needs_review",
+        "record_status": "needs_review",
+        "record_status_reason": "",
+    }
+    if not cleaned_card_text.strip():
+        cleaned_card_text = "\n".join(
+            [segment for segment in [cleaned_serial_zone, cleaned_elector_zone, cleaned_body_zone] if segment]
+        ).strip()
+    cleaned_card_text, card_labels = _normalize_card_label_variants(cleaned_card_text)
+    normalized_labels_detected.update(card_labels)
+    parse_meta["normalized_labels_detected"] = sorted(normalized_labels_detected)
+    if not cleaned_card_text.strip():
+        parse_meta["field_parse_quality"] = {
+            "serial_number": "missing",
+            "elector_id": "missing",
+            "name": "missing",
+        }
+        return None, "rejected_noise", "empty card text after cleanup", [
+            "serial_number",
+            "elector_id",
+            "name",
+        ], parse_meta
+
+    parse_text = cleaned_body_zone or cleaned_card_text
+    field_quality: dict[str, str] = {}
+
+    serial_number = ""
+    serial_quality = "missing"
+    serial_candidates: list[tuple[str, str]] = []
+    serial_digits_candidate = re.sub(r"\D", "", str(serial_zone_digits_text or ""))
+    if serial_digits_candidate and len(serial_digits_candidate) <= 4:
+        serial_candidates.append((serial_digits_candidate.lstrip("0") or serial_digits_candidate, "zone_digits_pass_a"))
+    serial_verify_candidate = re.sub(r"\D", "", str(serial_zone_verify_text or ""))
+    if serial_verify_candidate and len(serial_verify_candidate) <= 4:
+        serial_candidates.append((serial_verify_candidate.lstrip("0") or serial_verify_candidate, "micro_digits_pass_b"))
+    for candidate_value, candidate_source in serial_candidates:
+        if re.fullmatch(r"\d{1,5}", candidate_value):
+            serial_number = candidate_value
+            serial_quality = "direct_strong_match"
+            if candidate_source == "zone_digits_pass_a":
+                break
+    if not serial_number:
+        serial_zone_candidate = _parse_serial_number(cleaned_serial_zone)
+        if serial_zone_candidate and re.fullmatch(r"\d{1,5}", serial_zone_candidate):
+            serial_number = serial_zone_candidate
+            serial_quality = "direct_zone_match"
+    if not serial_number:
+        body_serial = _parse_serial_number(cleaned_body_zone, allow_loose=True)
+        if body_serial and re.fullmatch(r"\d{1,5}", body_serial):
+            serial_number = body_serial
+            serial_quality = "fallback_inference"
+    if not serial_number:
+        fallback_serial = _parse_serial_number(cleaned_card_text, allow_loose=True)
+        if fallback_serial and re.fullmatch(r"\d{1,5}", fallback_serial):
+            serial_number = fallback_serial
+            serial_quality = "fallback_inference"
+    if serial_number and not re.fullmatch(r"\d{1,5}", serial_number):
+        serial_number = ""
+        serial_quality = "invalid_rejected"
+    parse_meta["serial_number_cleaned"] = serial_number or None
+    parse_meta["serial_candidates"] = [candidate for candidate, _ in serial_candidates] + [
+        value
+        for value in [serial_number]
+        if value
+    ]
+    field_quality["serial_number"] = serial_quality if serial_number else "missing"
+
+    elector_id = ""
+    elector_quality = "missing"
+    elector_candidates: list[str] = []
+    elector_zone_candidate = _parse_elector_id(cleaned_elector_zone)
+    if elector_zone_candidate:
+        elector_id = elector_zone_candidate
+        elector_quality = "direct_zone_match"
+        elector_candidates.append(elector_zone_candidate)
+    if not elector_id:
+        elector_verify_candidate = _parse_elector_id(cleaned_elector_verify_zone)
+        if elector_verify_candidate:
+            elector_id = elector_verify_candidate
+            elector_quality = "direct_strong_match"
+            elector_candidates.append(elector_verify_candidate)
+    if not elector_id:
+        elector_card_candidate = _parse_elector_id(cleaned_card_text)
+        if elector_card_candidate:
+            elector_id = elector_card_candidate
+            elector_quality = "normalized_fuzzy_match"
+            elector_candidates.append(elector_card_candidate)
+    if not elector_id:
+        elector_body_candidate = _parse_elector_id(cleaned_body_zone)
+        if elector_body_candidate:
+            elector_id = elector_body_candidate
+            elector_quality = "fallback_inference"
+            elector_candidates.append(elector_body_candidate)
+    if elector_id and not _is_valid_elector_id(elector_id):
+        elector_id = ""
+        elector_quality = "invalid_rejected"
+    parse_meta["elector_id_cleaned"] = elector_id or None
+    parse_meta["elector_candidates"] = elector_candidates
+    field_quality["elector_id"] = elector_quality if elector_id else "missing"
+
+    name = _extract_labeled_value_strict(
+        parse_text,
         [
-            r"name of elector",
-            r"elector'?s name",
-            r"name",
-            r"नाम",
+            r"name(?:\s+of\s+elector)?",
+            r"elector'?s\s+name",
         ],
     )
     if not name:
-        name = _infer_card_name(cleaned_card_text, elector_id)
-    name = re.sub(
-        r"(?i)\b(?:father|mother|husband|wife)(?:'?s)?\s+name\b.*$",
-        "",
-        name,
-    )
+        name = _extract_labeled_value_strict(
+            cleaned_card_text,
+            [
+                r"name(?:\s+of\s+elector)?",
+                r"elector'?s\s+name",
+            ],
+        )
     name = _clean_card_field(name)
+    field_quality["name"] = "direct_strong_match" if name else "missing"
 
-    relative_type, relative_name = _parse_relative_fields(cleaned_card_text)
-    relative_name = _clean_card_field(relative_name)
-    house_number = _parse_house_number(cleaned_card_text)
-    age, gender = _parse_age_and_gender(cleaned_card_text)
+    relative_type = ""
+    relative_name = ""
+    strict_relative_map: list[tuple[str, list[str]]] = [
+        ("father", [r"fathers?\s+name", r"father'?s\s+name"]),
+        ("husband", [r"husbands?\s+name", r"husband'?s\s+name"]),
+        ("mother", [r"mothers?\s+name", r"mother'?s\s+name"]),
+    ]
+    for rel_type, rel_labels in strict_relative_map:
+        relative_candidate = _extract_labeled_value_strict(parse_text, rel_labels)
+        if not relative_candidate:
+            relative_candidate = _extract_labeled_value_strict(cleaned_card_text, rel_labels)
+        if relative_candidate:
+            relative_type = rel_type
+            relative_name = _clean_card_field(relative_candidate)
+            break
+    field_quality["relative_name"] = "direct_strong_match" if relative_name else "missing"
+
+    house_number = _extract_labeled_value_strict(
+        parse_text,
+        [r"house\s+number", r"house\s+no\.?", r"house\s+no", r"h\.?\s*no\.?"],
+    )
+    if not house_number:
+        house_number = _extract_labeled_value_strict(
+            cleaned_card_text,
+            [r"house\s+number", r"house\s+no\.?", r"house\s+no", r"h\.?\s*no\.?"],
+        )
+    house_number = _clean_card_field(house_number)
+    field_quality["house_number"] = "direct_strong_match" if house_number else "missing"
+
+    age = None
+    age_quality = "missing"
+    age_value = _extract_labeled_value_strict(parse_text, [r"age"])
+    if not age_value:
+        age_value = _extract_labeled_value_strict(cleaned_card_text, [r"age"])
+    age_match = re.search(r"\b(\d{1,3})\b", age_value)
+    if not age_match:
+        line_age_match = re.search(r"(?im)\bage\b[^0-9]{0,6}(\d{1,3})\b", parse_text or cleaned_card_text)
+        if line_age_match:
+            age_match = line_age_match
+            age_quality = "normalized_fuzzy_match"
+    if age_match:
+        age = int(age_match.group(1))
+        if age <= 0 or age > 120:
+            age = None
+        else:
+            if age_quality == "missing":
+                age_quality = "direct_strong_match"
+    field_quality["age"] = age_quality if age is not None else "missing"
+
+    gender = ""
+    gender_quality = "missing"
+    gender_value = _extract_labeled_value_strict(parse_text, [r"gender"])
+    if not gender_value:
+        gender_value = _extract_labeled_value_strict(cleaned_card_text, [r"gender"])
+        if gender_value:
+            gender_quality = "normalized_fuzzy_match"
+    if not gender_value:
+        combined_age_gender = re.search(
+            r"(?im)\bage\b[^0-9]{0,6}\d{1,3}\b.{0,20}\b(?:gender|sex)\b[^A-Za-z0-9]{0,6}([A-Za-z]{1,12})",
+            parse_text or cleaned_card_text,
+        )
+        if combined_age_gender:
+            gender_value = combined_age_gender.group(1)
+            gender_quality = "fallback_inference"
+    if not gender_value:
+        direct_gender_match = re.search(
+            r"(?im)\b(ma[li1][eec]?|fem[a-z]{1,5}|male|female|m|f|other)\b",
+            parse_text or cleaned_card_text,
+        )
+        if direct_gender_match:
+            gender_value = direct_gender_match.group(1)
+            gender_quality = "fallback_inference"
+    gender = _normalize_gender_token(gender_value)
+    if gender and gender_quality == "missing":
+        gender_quality = "direct_strong_match"
+    field_quality["gender"] = gender_quality if gender else "missing"
+
+    if _is_junk_field_value(relative_name):
+        relative_name = ""
+        relative_type = ""
+    if _is_junk_field_value(house_number):
+        house_number = ""
+
+    body_house = _extract_labeled_value_strict(parse_text, [r"house\s+number", r"house\s+no\.?", r"h\.?\s*no\.?"])
+    body_age_text = _extract_labeled_value_strict(parse_text, [r"age"])
+    body_gender_text = _extract_labeled_value_strict(parse_text, [r"gender"])
+    body_age = int(re.search(r"\b(\d{1,3})\b", body_age_text).group(1)) if re.search(r"\b(\d{1,3})\b", body_age_text) else None
+    body_gender = body_gender_text
+    body_has_lower_signals = bool(body_house or body_age is not None or body_gender)
+
+    serial_confidence, serial_confidence_reason = _classify_serial_confidence(
+        serial_number=serial_number,
+        parse_quality=field_quality.get("serial_number", "missing"),
+        slot_index=slot_index,
+        expected_slots=expected_slots,
+        serial_pass_a_text=str(serial_zone_digits_text or serial_zone_text or ""),
+        serial_pass_b_text=str(serial_zone_verify_text or ""),
+    )
+    elector_confidence, elector_confidence_reason = _classify_elector_confidence(
+        elector_id=elector_id,
+        parse_quality=field_quality.get("elector_id", "missing"),
+        elector_pass_a_text=str(elector_zone_text or ""),
+        elector_pass_b_text=str(elector_zone_verify_text or ""),
+    )
+    parse_meta["serial_confidence"] = serial_confidence
+    parse_meta["serial_confidence_reason"] = serial_confidence_reason
+    parse_meta["elector_confidence"] = elector_confidence
+    parse_meta["elector_confidence_reason"] = elector_confidence_reason
 
     parsed_record = {
         "serial_number": serial_number or None,
@@ -1553,11 +2568,81 @@ def _parse_card_record(
         "extraction_method": extraction_method,
         "raw_record_text": raw_card_text.replace("\r", "\n").strip(),
     }
-    parse_status, reason = _classify_card_record(parsed_record)
-    if parse_status == "rejected":
-        return None, parse_status, reason
+    parse_meta["field_parse_quality"] = field_quality
+    missing_fields = _missing_fields_for_record(parsed_record)
+    parse_status, reason = _classify_card_record(parsed_record, body_has_lower_signals=body_has_lower_signals)
+
+    if parse_status == "rejected_noise":
+        record_status = "needs_review"
+        record_status_reason = reason or "rejected"
+    elif serial_confidence == "trusted" and elector_confidence == "trusted" and parse_status == "valid":
+        record_status = "trusted"
+        record_status_reason = "sensitive fields verified"
+    elif serial_confidence == "needs_review" or elector_confidence == "needs_review":
+        record_status = "needs_review"
+        record_status_reason = "sensitive field invalid/weak"
+    elif serial_confidence == "low_confidence" or elector_confidence == "low_confidence":
+        record_status = "needs_review"
+        record_status_reason = "sensitive field low confidence"
+    elif parse_status != "valid":
+        record_status = "partial"
+        record_status_reason = parse_status
+    else:
+        record_status = "trusted"
+        record_status_reason = "record validated"
+    parse_meta["record_status"] = record_status
+    parse_meta["record_status_reason"] = record_status_reason
+
+    if parse_status == "rejected_noise":
+        return None, parse_status, reason, missing_fields, parse_meta
     parsed_record["_parse_status"] = parse_status
-    return parsed_record, parse_status, reason or None
+    parsed_record["_record_status"] = record_status
+    parsed_record["_record_status_reason"] = record_status_reason
+    parsed_record["_missing_fields"] = missing_fields
+    parsed_record["_field_parse_quality"] = dict(field_quality)
+    parsed_record["_serial_confidence"] = serial_confidence
+    parsed_record["_serial_confidence_reason"] = serial_confidence_reason
+    parsed_record["_elector_confidence"] = elector_confidence
+    parsed_record["_elector_confidence_reason"] = elector_confidence_reason
+    parsed_record["_normalized_labels"] = sorted(normalized_labels_detected)
+    return parsed_record, parse_status, reason or None, missing_fields, parse_meta
+
+
+def _should_retry_top_capture(
+    *,
+    parse_status: str,
+    missing_fields: Sequence[str],
+    cleaned_body_text: str,
+) -> bool:
+    missing_set = set(missing_fields or [])
+    top_field_missing = bool({"serial_number", "elector_id", "name"} & missing_set)
+    if not top_field_missing:
+        return False
+    if parse_status == "partial_top_missing":
+        return True
+    body_house = _parse_house_number(cleaned_body_text)
+    body_age, body_gender = _parse_age_and_gender(cleaned_body_text)
+    return bool(body_house or body_age is not None or body_gender)
+
+
+def _is_useful_record_for_insert(record: dict[str, Any] | None, parse_status: str) -> bool:
+    if record is None:
+        return False
+    if parse_status == "valid":
+        return True
+    if parse_status not in {"partial_top_missing", "partial_field_missing"}:
+        return False
+    name_value = str(record.get("name") or "").strip()
+    if not name_value or _is_noise_name(name_value):
+        return False
+    return any(
+        [
+            str(record.get("elector_id") or "").strip(),
+            str(record.get("serial_number") or "").strip(),
+            str(record.get("house_number") or "").strip(),
+            record.get("age") is not None,
+        ]
+    )
 
 
 def parse_voter_records_from_page_layout_aware(
@@ -1585,14 +2670,43 @@ def parse_voter_records_from_page_layout_aware(
         "detection_strategy": "",
         "detection_error": None,
         "cards_detected": 0,
+        "slots_detected_support": 0,
+        "slots_expected": 0,
+        "slots_ocr_attempted": 0,
         "cards_with_text": 0,
         "cards_parsed": 0,
         "cards_valid": 0,
         "cards_partial": 0,
         "cards_rejected": 0,
+        "cards_missing_top_fields": 0,
+        "cards_top_retry_attempted": 0,
+        "cards_top_retry_used": 0,
         "cards_inserted": 0,
         "expected_card_count": 0,
         "reject_reason_breakdown": {},
+        "failed_slots": [],
+        "failed_slot_indexes": [],
+        "slot_template_meta": {},
+        "header_bbox": {},
+        "header_ocr_text": "",
+        "header_ocr_error": None,
+        "header_ocr_preprocess": None,
+        "header_crop_png_bytes": None,
+        "header_metadata": {},
+        "metadata_values": {},
+        "constituency_parsed": False,
+        "section_name_parsed": False,
+        "part_number_parsed": False,
+        "records_metadata_propagated": 0,
+        "records_total_for_insert": 0,
+        "serial_number_filled_count": 0,
+        "elector_id_valid_count": 0,
+        "gender_filled_count": 0,
+        "records_partial_after_cleanup": 0,
+        "trusted_records_count": 0,
+        "needs_review_records_count": 0,
+        "serial_low_confidence_count": 0,
+        "elector_id_low_confidence_count": 0,
         "cards": [],
     }
 
@@ -1603,97 +2717,307 @@ def parse_voter_records_from_page_layout_aware(
         debug_payload["cards_parsed"] = len(fallback_records)
         debug_payload["cards_valid"] = len(fallback_records)
         debug_payload["cards_partial"] = 0
+        debug_payload["slots_expected"] = len(fallback_records)
         return {"records": fallback_records, "debug": debug_payload}
 
-    boxes, detection_strategy, detection_error = _detect_voter_card_boxes(page_image)
+    support_boxes, detection_strategy, detection_error = _detect_voter_card_boxes(page_image)
+    page_width, page_height = page_image.size
+    slot_boxes, template_meta = _derive_template_slot_boxes(
+        width=page_width,
+        height=page_height,
+        support_boxes=support_boxes,
+    )
     debug_payload["detection_strategy"] = detection_strategy
     debug_payload["detection_error"] = detection_error
-    debug_payload["cards_detected"] = len(boxes)
-    if len(boxes) >= 18:
-        debug_payload["expected_card_count"] = 24
-    else:
-        debug_payload["expected_card_count"] = len(boxes)
-    if not boxes:
+    debug_payload["cards_detected"] = len(support_boxes)
+    debug_payload["slots_detected_support"] = len(support_boxes)
+    debug_payload["slots_expected"] = len(slot_boxes)
+    debug_payload["expected_card_count"] = len(slot_boxes)
+    debug_payload["slot_template_meta"] = template_meta
+    if not slot_boxes:
         debug_payload["mode"] = "page_text_fallback"
         debug_payload["cards_parsed"] = len(fallback_records)
         debug_payload["cards_valid"] = len(fallback_records)
         debug_payload["cards_partial"] = 0
-        debug_payload["cards_rejected"] = max(0, int(debug_payload["cards_detected"]) - int(debug_payload["cards_parsed"]))
+        debug_payload["cards_rejected"] = 0
         return {"records": fallback_records, "debug": debug_payload}
 
-    if not constituency or not section_name:
-        header_crop = page_image.crop((0, 0, page_image.size[0], max(1, int(page_image.size[1] * 0.2))))
-        header_text, _, _ = _ocr_card_image(header_crop, timeout_seconds=min(float(ocr_timeout_seconds or 20), 8.0))
-        header_constituency, header_section = _extract_context(header_text)
-        constituency = constituency or header_constituency or None
-        section_name = section_name or header_section or None
+    header_payload = _extract_page_header_metadata(
+        page_image=page_image,
+        support_boxes=support_boxes,
+        ocr_timeout_seconds=ocr_timeout_seconds,
+        include_preview=bool(include_card_debug),
+    )
+    header_metadata = dict(header_payload.get("metadata") or {})
+    header_constituency = str(header_metadata.get("constituency") or "").strip()
+    header_section_name = str(header_metadata.get("section_name") or "").strip()
+    header_part_number = str(header_metadata.get("part_number") or "").strip()
+    page_text_part_number = _extract_part_number(page_text)
+
+    # Prefer explicit page-header metadata, fall back to page-text context when needed.
+    constituency = header_constituency or str(constituency or "").strip() or None
+    section_name = header_section_name or str(section_name or "").strip() or None
+    part_number = header_part_number or page_text_part_number or None
+
+    debug_payload["header_bbox"] = dict(header_payload.get("bbox") or {})
+    debug_payload["header_ocr_text"] = str(header_payload.get("ocr_text") or "")
+    debug_payload["header_ocr_error"] = header_payload.get("ocr_error")
+    debug_payload["header_ocr_preprocess"] = header_payload.get("ocr_preprocess")
+    debug_payload["header_crop_png_bytes"] = header_payload.get("crop_png_bytes")
+    debug_payload["header_metadata"] = {
+        "constituency": constituency,
+        "section_name": section_name,
+        "part_number": part_number,
+    }
+    debug_payload["metadata_values"] = {
+        "constituency": constituency,
+        "section_name": section_name,
+        "part_number": part_number,
+    }
+    debug_payload["constituency_parsed"] = bool(constituency)
+    debug_payload["section_name_parsed"] = bool(section_name)
+    debug_payload["part_number_parsed"] = bool(part_number)
 
     parsed_records: list[dict[str, Any]] = []
     cards_debug: list[dict[str, Any]] = []
-    for card_index, box in enumerate(boxes, start=1):
-        x1, y1, x2, y2 = box
+    failed_slots: list[dict[str, Any]] = []
+    retry_extra_top_ratio = _float_env("NAME_SEARCH_CARD_RETRY_TOP_EXTRA", 0.14, minimum=0.0, maximum=0.25)
+    for card_index, box in enumerate(slot_boxes, start=1):
+        debug_payload["slots_ocr_attempted"] = int(debug_payload.get("slots_ocr_attempted", 0)) + 1
+        original_x1, original_y1, original_x2, original_y2 = [int(value) for value in box]
+        expanded_box = _expand_box(
+            (original_x1, original_y1, original_x2, original_y2),
+            width=page_width,
+            height=page_height,
+        )
+        x1, y1, x2, y2 = expanded_box
         card_image = page_image.crop((x1, y1, x2, y2))
-        raw_card_text, ocr_error, ocr_meta = _ocr_card_image(card_image, timeout_seconds=ocr_timeout_seconds)
+
+        zone_ocr_payload = _ocr_card_zones(card_image, timeout_seconds=ocr_timeout_seconds)
+        raw_card_text = str(zone_ocr_payload.get("combined_text") or "")
+        ocr_error = zone_ocr_payload.get("combined_error")
         cleaned_card_text = _clean_card_ocr_text(raw_card_text)
+        cleaned_body_text = _clean_card_ocr_text(str(zone_ocr_payload.get("body_text") or ""))
         if cleaned_card_text.strip():
             debug_payload["cards_with_text"] = int(debug_payload["cards_with_text"]) + 1
 
-        record, parse_status, reject_reason = _parse_card_record(
+        record, parse_status, reject_reason, missing_fields, parse_meta = _parse_card_record(
             raw_card_text=raw_card_text,
             cleaned_card_text=cleaned_card_text,
+            serial_zone_text=str(zone_ocr_payload.get("serial_text") or ""),
+            serial_zone_digits_text=str(zone_ocr_payload.get("serial_digits_text") or ""),
+            serial_zone_verify_text=str(zone_ocr_payload.get("serial_verify_text") or ""),
+            elector_zone_text=str(zone_ocr_payload.get("elector_text") or ""),
+            elector_zone_verify_text=str(zone_ocr_payload.get("elector_verify_text") or ""),
+            body_zone_text=str(zone_ocr_payload.get("body_text") or ""),
             file_name=file_name,
             file_path=file_path,
             page_number=page_number,
             constituency=constituency,
             section_name=section_name,
             extraction_method=f"card_ocr_{detection_strategy}",
+            slot_index=card_index,
+            expected_slots=len(slot_boxes),
         )
-        accepted = parse_status in {"valid", "partial"} and record is not None
-        if accepted:
-            parsed_records.append(record)
-            if parse_status == "valid":
-                debug_payload["cards_valid"] = int(debug_payload.get("cards_valid", 0)) + 1
-            else:
-                debug_payload["cards_partial"] = int(debug_payload.get("cards_partial", 0)) + 1
+        top_retry_attempted = False
+        top_retry_used = False
+        retry_expanded_box = expanded_box
+        if _should_retry_top_capture(
+            parse_status=parse_status,
+            missing_fields=missing_fields,
+            cleaned_body_text=cleaned_body_text,
+        ):
+            top_retry_attempted = True
+            debug_payload["cards_top_retry_attempted"] = int(debug_payload.get("cards_top_retry_attempted", 0)) + 1
+            retry_expanded_box = _expand_box(
+                (original_x1, original_y1, original_x2, original_y2),
+                width=page_width,
+                height=page_height,
+                extra_top_ratio=retry_extra_top_ratio,
+            )
+            if retry_expanded_box != expanded_box:
+                retry_card_image = page_image.crop(retry_expanded_box)
+                retry_zone_ocr = _ocr_card_zones(retry_card_image, timeout_seconds=ocr_timeout_seconds)
+                retry_raw_text = str(retry_zone_ocr.get("combined_text") or "")
+                retry_cleaned_text = _clean_card_ocr_text(retry_raw_text)
+                retry_record, retry_status, retry_reason, retry_missing_fields, retry_parse_meta = _parse_card_record(
+                    raw_card_text=retry_raw_text,
+                    cleaned_card_text=retry_cleaned_text,
+                    serial_zone_text=str(retry_zone_ocr.get("serial_text") or ""),
+                    serial_zone_digits_text=str(retry_zone_ocr.get("serial_digits_text") or ""),
+                    serial_zone_verify_text=str(retry_zone_ocr.get("serial_verify_text") or ""),
+                    elector_zone_text=str(retry_zone_ocr.get("elector_text") or ""),
+                    elector_zone_verify_text=str(retry_zone_ocr.get("elector_verify_text") or ""),
+                    body_zone_text=str(retry_zone_ocr.get("body_text") or ""),
+                    file_name=file_name,
+                    file_path=file_path,
+                    page_number=page_number,
+                    constituency=constituency,
+                    section_name=section_name,
+                    extraction_method=f"card_ocr_{detection_strategy}_top_retry",
+                    slot_index=card_index,
+                    expected_slots=len(slot_boxes),
+                )
+                current_rank = _parse_status_rank(parse_status)
+                retry_rank = _parse_status_rank(retry_status)
+                if retry_rank > current_rank or (
+                    retry_rank == current_rank and len(retry_missing_fields) < len(missing_fields)
+                ):
+                    top_retry_used = True
+                    debug_payload["cards_top_retry_used"] = int(debug_payload.get("cards_top_retry_used", 0)) + 1
+                    record = retry_record
+                    parse_status = retry_status
+                    reject_reason = retry_reason
+                    missing_fields = retry_missing_fields
+                    parse_meta = retry_parse_meta
+                    zone_ocr_payload = retry_zone_ocr
+                    raw_card_text = retry_raw_text
+                    cleaned_card_text = retry_cleaned_text
+                    cleaned_body_text = _clean_card_ocr_text(str(retry_zone_ocr.get("body_text") or ""))
+                    ocr_error = retry_zone_ocr.get("combined_error")
+                    expanded_box = retry_expanded_box
+                    x1, y1, x2, y2 = expanded_box
+                    card_image = retry_card_image
+
+        parsed_slot = parse_status in {"valid", "partial_top_missing", "partial_field_missing"}
+        insert_candidate = _is_useful_record_for_insert(record, parse_status=parse_status)
+
+        if parse_status == "valid":
+            debug_payload["cards_valid"] = int(debug_payload.get("cards_valid", 0)) + 1
+        elif parse_status in {"partial_top_missing", "partial_field_missing"}:
+            debug_payload["cards_partial"] = int(debug_payload.get("cards_partial", 0)) + 1
+            if parse_status == "partial_top_missing":
+                debug_payload["cards_missing_top_fields"] = int(debug_payload.get("cards_missing_top_fields", 0)) + 1
         else:
             debug_payload["cards_rejected"] = int(debug_payload.get("cards_rejected", 0)) + 1
             reason_key = (reject_reason or "rejected").strip() or "rejected"
             reject_breakdown = dict(debug_payload.get("reject_reason_breakdown", {}))
             reject_breakdown[reason_key] = int(reject_breakdown.get(reason_key, 0)) + 1
             debug_payload["reject_reason_breakdown"] = reject_breakdown
+            failed_slots.append(
+                {
+                    "slot_index": int(card_index),
+                    "parse_status": parse_status,
+                    "reason": reason_key,
+                    "missing_fields": list(missing_fields),
+                }
+            )
+
+        if insert_candidate and record is not None:
+            parsed_records.append(record)
 
         if include_card_debug:
             card_debug_entry: dict[str, Any] = {
+                "slot_index": card_index,
                 "card_index": card_index,
+                "original_bbox": {
+                    "x1": int(original_x1),
+                    "y1": int(original_y1),
+                    "x2": int(original_x2),
+                    "y2": int(original_y2),
+                },
+                "expanded_bbox": {"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2)},
                 "bbox": {"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2)},
                 "ocr_error": ocr_error,
-                "ocr_preprocess": (ocr_meta or {}).get("preprocess"),
-                "accepted": accepted,
+                "ocr_preprocess": dict(zone_ocr_payload.get("preprocess") or {}),
+                "accepted": insert_candidate,
                 "reject_reason": reject_reason,
                 "parse_status": parse_status,
                 "validation_status": parse_status,
-                "db_insert_status": "pending_insert" if accepted else "rejected_not_inserted",
+                "insert_decision": (
+                    "will_insert"
+                    if insert_candidate
+                    else ("skip_rejected" if not parsed_slot else "skip_partial_not_useful")
+                ),
+                "db_insert_status": (
+                    "pending_insert"
+                    if insert_candidate
+                    else ("rejected_not_inserted" if not parsed_slot else "partial_not_inserted")
+                ),
                 "raw_ocr_text": raw_card_text.strip(),
                 "cleaned_ocr_text": cleaned_card_text,
+                "serial_zone_ocr_text": str(zone_ocr_payload.get("serial_text") or ""),
+                "serial_zone_digits_ocr_text": str(zone_ocr_payload.get("serial_digits_text") or ""),
+                "serial_zone_verify_ocr_text": str(zone_ocr_payload.get("serial_verify_text") or ""),
+                "elector_zone_ocr_text": str(zone_ocr_payload.get("elector_text") or ""),
+                "elector_zone_verify_ocr_text": str(zone_ocr_payload.get("elector_verify_text") or ""),
+                "body_zone_ocr_text": str(zone_ocr_payload.get("body_text") or ""),
+                "cleaned_serial_number": parse_meta.get("serial_number_cleaned"),
+                "cleaned_elector_id": parse_meta.get("elector_id_cleaned"),
+                "serial_candidates": list(parse_meta.get("serial_candidates") or []),
+                "elector_candidates": list(parse_meta.get("elector_candidates") or []),
+                "serial_confidence": str(parse_meta.get("serial_confidence") or ""),
+                "serial_confidence_reason": str(parse_meta.get("serial_confidence_reason") or ""),
+                "elector_confidence": str(parse_meta.get("elector_confidence") or ""),
+                "elector_confidence_reason": str(parse_meta.get("elector_confidence_reason") or ""),
+                "record_status": str(parse_meta.get("record_status") or ""),
+                "record_status_reason": str(parse_meta.get("record_status_reason") or ""),
+                "normalized_labels_detected": list(parse_meta.get("normalized_labels_detected") or []),
+                "field_parse_quality": dict(parse_meta.get("field_parse_quality") or {}),
+                "zone_bboxes": dict(zone_ocr_payload.get("zone_bboxes") or {}),
+                "missing_fields": list(missing_fields),
+                "top_retry_attempted": bool(top_retry_attempted),
+                "top_retry_used": bool(top_retry_used),
+                "retry_expanded_bbox": {
+                    "x1": int(retry_expanded_box[0]),
+                    "y1": int(retry_expanded_box[1]),
+                    "x2": int(retry_expanded_box[2]),
+                    "y2": int(retry_expanded_box[3]),
+                },
                 "parsed_record": record,
             }
-            if card_index <= max(1, int(max_preview_cards)):
-                crop_buffer = io.BytesIO()
-                try:
-                    card_image.save(crop_buffer, format="PNG")
-                    card_debug_entry["crop_png_bytes"] = crop_buffer.getvalue()
-                except Exception:  # noqa: BLE001
-                    card_debug_entry["crop_png_bytes"] = None
+            crop_buffer = io.BytesIO()
+            try:
+                card_image.save(crop_buffer, format="PNG")
+                card_debug_entry["crop_png_bytes"] = crop_buffer.getvalue()
+            except Exception:  # noqa: BLE001
+                card_debug_entry["crop_png_bytes"] = None
             cards_debug.append(card_debug_entry)
 
-    debug_payload["cards_parsed"] = len(parsed_records)
+    debug_payload["cards_parsed"] = int(debug_payload.get("cards_valid", 0)) + int(debug_payload.get("cards_partial", 0))
     debug_payload["cards_valid"] = int(debug_payload.get("cards_valid", 0))
     debug_payload["cards_partial"] = int(debug_payload.get("cards_partial", 0))
+    debug_payload["cards_rejected"] = int(debug_payload.get("cards_rejected", 0))
+    debug_payload["cards_missing_top_fields"] = int(debug_payload.get("cards_missing_top_fields", 0))
+    debug_payload["cards_top_retry_attempted"] = int(debug_payload.get("cards_top_retry_attempted", 0))
+    debug_payload["cards_top_retry_used"] = int(debug_payload.get("cards_top_retry_used", 0))
+    debug_payload["records_total_for_insert"] = len(parsed_records)
+    debug_payload["records_metadata_propagated"] = sum(
+        1
+        for record in parsed_records
+        if str(record.get("constituency") or "").strip() or str(record.get("section_name") or "").strip()
+    )
+    debug_payload["serial_number_filled_count"] = sum(
+        1 for record in parsed_records if str(record.get("serial_number") or "").strip()
+    )
+    debug_payload["elector_id_valid_count"] = sum(
+        1 for record in parsed_records if _is_valid_elector_id(str(record.get("elector_id") or ""))
+    )
+    debug_payload["gender_filled_count"] = sum(
+        1 for record in parsed_records if str(record.get("gender") or "").strip()
+    )
+    debug_payload["records_partial_after_cleanup"] = sum(
+        1 for record in parsed_records if str(record.get("_record_status") or "") == "partial"
+    )
+    debug_payload["trusted_records_count"] = sum(
+        1 for record in parsed_records if str(record.get("_record_status") or "") == "trusted"
+    )
+    debug_payload["needs_review_records_count"] = sum(
+        1 for record in parsed_records if str(record.get("_record_status") or "") == "needs_review"
+    )
+    debug_payload["serial_low_confidence_count"] = sum(
+        1 for record in parsed_records if str(record.get("_serial_confidence") or "") in {"low_confidence", "needs_review"}
+    )
+    debug_payload["elector_id_low_confidence_count"] = sum(
+        1 for record in parsed_records if str(record.get("_elector_confidence") or "") in {"low_confidence", "needs_review"}
+    )
+    debug_payload["failed_slots"] = failed_slots
+    debug_payload["failed_slot_indexes"] = [int(item["slot_index"]) for item in failed_slots]
     if "reject_reason_breakdown" not in debug_payload:
         debug_payload["reject_reason_breakdown"] = {}
     debug_payload["cards"] = cards_debug
     if not parsed_records and not debug_payload.get("detection_error"):
-        debug_payload["detection_error"] = "no valid card records parsed from detected card regions"
+        debug_payload["detection_error"] = "no valid/partial useful slot records parsed"
     return {"records": parsed_records, "debug": debug_payload}
 
 

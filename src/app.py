@@ -9,6 +9,14 @@ from pathlib import Path
 import importlib.util
 import shutil
 import sys
+# NumPy 2.x removed aliases used by chromadb==0.4.22; add a small compatibility shim
+# so the app can still start even before environment downgrade.
+try:
+    import numpy as _np
+    if not hasattr(_np, "float_"):
+        _np.float_ = _np.float64  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001
+    pass
 import chromadb
 from chromadb.utils import embedding_functions
 import PyPDF2
@@ -158,6 +166,16 @@ if 'name_search_test_selected_file' not in st.session_state:
     st.session_state.name_search_test_selected_file = "(auto: first discovered)"
 if 'name_search_test_replace_existing' not in st.session_state:
     st.session_state.name_search_test_replace_existing = True
+if 'name_search_card_pad_left' not in st.session_state:
+    st.session_state.name_search_card_pad_left = 0.03
+if 'name_search_card_pad_right' not in st.session_state:
+    st.session_state.name_search_card_pad_right = 0.03
+if 'name_search_card_pad_top' not in st.session_state:
+    st.session_state.name_search_card_pad_top = 0.12
+if 'name_search_card_pad_bottom' not in st.session_state:
+    st.session_state.name_search_card_pad_bottom = 0.05
+if 'name_search_card_retry_top_extra' not in st.session_state:
+    st.session_state.name_search_card_retry_top_extra = 0.14
 if 'name_search_ocr_timeout_seconds' not in st.session_state:
     st.session_state.name_search_ocr_timeout_seconds = 20
 if 'name_search_overall_timeout_seconds' not in st.session_state:
@@ -930,6 +948,11 @@ def show_name_search_workflow():
     test_max_pages_per_file = int(st.session_state.get("name_search_test_max_pages_per_file", 1))
     selected_test_file = str(st.session_state.get("name_search_test_selected_file", "(auto: first discovered)"))
     test_replace_existing = bool(st.session_state.get("name_search_test_replace_existing", True))
+    card_pad_left = float(st.session_state.get("name_search_card_pad_left", 0.03))
+    card_pad_right = float(st.session_state.get("name_search_card_pad_right", 0.03))
+    card_pad_top = float(st.session_state.get("name_search_card_pad_top", 0.12))
+    card_pad_bottom = float(st.session_state.get("name_search_card_pad_bottom", 0.05))
+    card_retry_top_extra = float(st.session_state.get("name_search_card_retry_top_extra", 0.14))
 
     if test_mode:
         test_col1, test_col2 = st.columns(2)
@@ -965,6 +988,63 @@ def show_name_search_workflow():
             value=bool(st.session_state.get("name_search_test_replace_existing", True)),
             key="name_search_test_replace_existing",
             help="When enabled, existing records for the same document+page are replaced before test inserts.",
+        )
+        st.caption("Card crop padding (test mode)")
+        pad_col1, pad_col2, pad_col3, pad_col4, pad_col5 = st.columns(5)
+        card_pad_left = float(
+            pad_col1.number_input(
+                "Pad left",
+                min_value=0.0,
+                max_value=0.15,
+                value=float(st.session_state.get("name_search_card_pad_left", 0.03)),
+                step=0.01,
+                format="%.2f",
+                key="name_search_card_pad_left",
+            )
+        )
+        card_pad_right = float(
+            pad_col2.number_input(
+                "Pad right",
+                min_value=0.0,
+                max_value=0.15,
+                value=float(st.session_state.get("name_search_card_pad_right", 0.03)),
+                step=0.01,
+                format="%.2f",
+                key="name_search_card_pad_right",
+            )
+        )
+        card_pad_top = float(
+            pad_col3.number_input(
+                "Pad top",
+                min_value=0.0,
+                max_value=0.20,
+                value=float(st.session_state.get("name_search_card_pad_top", 0.12)),
+                step=0.01,
+                format="%.2f",
+                key="name_search_card_pad_top",
+            )
+        )
+        card_pad_bottom = float(
+            pad_col4.number_input(
+                "Pad bottom",
+                min_value=0.0,
+                max_value=0.20,
+                value=float(st.session_state.get("name_search_card_pad_bottom", 0.05)),
+                step=0.01,
+                format="%.2f",
+                key="name_search_card_pad_bottom",
+            )
+        )
+        card_retry_top_extra = float(
+            pad_col5.number_input(
+                "Retry extra top",
+                min_value=0.0,
+                max_value=0.25,
+                value=float(st.session_state.get("name_search_card_retry_top_extra", 0.14)),
+                step=0.01,
+                format="%.2f",
+                key="name_search_card_retry_top_extra",
+            )
         )
         if discovered_test_files:
             st.caption(f"Discovered PDFs for test mode: {len(discovered_test_files)}")
@@ -1043,6 +1123,12 @@ def show_name_search_workflow():
         st.session_state.name_search_ocr_timeout_seconds = int(ocr_timeout_seconds)
         st.session_state.name_search_overall_timeout_seconds = int(overall_timeout_seconds)
         st.session_state.name_search_last_action = action_mode
+
+        os.environ["NAME_SEARCH_CARD_PAD_LEFT"] = f"{float(card_pad_left):.4f}"
+        os.environ["NAME_SEARCH_CARD_PAD_RIGHT"] = f"{float(card_pad_right):.4f}"
+        os.environ["NAME_SEARCH_CARD_PAD_TOP"] = f"{float(card_pad_top):.4f}"
+        os.environ["NAME_SEARCH_CARD_PAD_BOTTOM"] = f"{float(card_pad_bottom):.4f}"
+        os.environ["NAME_SEARCH_CARD_RETRY_TOP_EXTRA"] = f"{float(card_retry_top_extra):.4f}"
 
         use_test_sampling = bool(test_mode) or action_mode == "test_one_page"
         if action_mode == "test_one_page":
@@ -1286,14 +1372,43 @@ def show_name_search_workflow():
                                     "detection_strategy": "error",
                                     "detection_error": str(exc),
                                     "cards_detected": 0,
+                                    "slots_detected_support": 0,
+                                    "slots_expected": 0,
+                                    "slots_ocr_attempted": 0,
                                     "cards_with_text": 0,
                                     "cards_parsed": 0,
                                     "cards_valid": 0,
                                     "cards_partial": 0,
                                     "cards_rejected": 0,
+                                    "cards_missing_top_fields": 0,
+                                    "cards_top_retry_attempted": 0,
+                                    "cards_top_retry_used": 0,
                                     "cards_inserted": 0,
                                     "expected_card_count": 0,
                                     "reject_reason_breakdown": {},
+                                    "failed_slots": [],
+                                    "failed_slot_indexes": [],
+                                    "slot_template_meta": {},
+                                    "header_bbox": {},
+                                    "header_ocr_text": "",
+                                    "header_ocr_error": None,
+                                    "header_ocr_preprocess": None,
+                                    "header_crop_png_bytes": None,
+                                    "header_metadata": {},
+                                    "metadata_values": {},
+                                    "constituency_parsed": False,
+                                    "section_name_parsed": False,
+                                    "part_number_parsed": False,
+                                    "records_metadata_propagated": 0,
+                                    "records_total_for_insert": 0,
+                                    "serial_number_filled_count": 0,
+                                    "elector_id_valid_count": 0,
+                                    "gender_filled_count": 0,
+                                    "records_partial_after_cleanup": 0,
+                                    "trusted_records_count": 0,
+                                    "needs_review_records_count": 0,
+                                    "serial_low_confidence_count": 0,
+                                    "elector_id_low_confidence_count": 0,
                                     "cards": [],
                                 }
 
@@ -1570,15 +1685,35 @@ def show_name_search_workflow():
                             "selected_test_file": str(selected_test_file),
                             "card_layout_mode": str((card_layout_debug_payload or {}).get("mode") or ""),
                             "card_detection_strategy": str((card_layout_debug_payload or {}).get("detection_strategy") or ""),
+                            "slots_detected_support": int((card_layout_debug_payload or {}).get("slots_detected_support") or 0),
+                            "slots_expected": int((card_layout_debug_payload or {}).get("slots_expected") or 0),
+                            "slots_ocr_attempted": int((card_layout_debug_payload or {}).get("slots_ocr_attempted") or 0),
                             "cards_detected": int((card_layout_debug_payload or {}).get("cards_detected") or 0),
                             "cards_with_text": int((card_layout_debug_payload or {}).get("cards_with_text") or 0),
                             "cards_parsed": int((card_layout_debug_payload or {}).get("cards_parsed") or 0),
                             "cards_valid": int((card_layout_debug_payload or {}).get("cards_valid") or 0),
                             "cards_partial": int((card_layout_debug_payload or {}).get("cards_partial") or 0),
                             "cards_rejected": int((card_layout_debug_payload or {}).get("cards_rejected") or 0),
+                            "cards_missing_top_fields": int((card_layout_debug_payload or {}).get("cards_missing_top_fields") or 0),
+                            "cards_top_retry_attempted": int((card_layout_debug_payload or {}).get("cards_top_retry_attempted") or 0),
+                            "cards_top_retry_used": int((card_layout_debug_payload or {}).get("cards_top_retry_used") or 0),
                             "cards_inserted": int((card_layout_debug_payload or {}).get("cards_inserted") or 0),
                             "expected_card_count": int((card_layout_debug_payload or {}).get("expected_card_count") or 0),
                             "reject_reason_breakdown": dict((card_layout_debug_payload or {}).get("reject_reason_breakdown") or {}),
+                            "failed_slot_indexes": list((card_layout_debug_payload or {}).get("failed_slot_indexes") or []),
+                            "constituency_parsed": bool((card_layout_debug_payload or {}).get("constituency_parsed")),
+                            "section_name_parsed": bool((card_layout_debug_payload or {}).get("section_name_parsed")),
+                            "part_number_parsed": bool((card_layout_debug_payload or {}).get("part_number_parsed")),
+                            "records_metadata_propagated": int((card_layout_debug_payload or {}).get("records_metadata_propagated") or 0),
+                            "records_total_for_insert": int((card_layout_debug_payload or {}).get("records_total_for_insert") or 0),
+                            "serial_number_filled_count": int((card_layout_debug_payload or {}).get("serial_number_filled_count") or 0),
+                            "elector_id_valid_count": int((card_layout_debug_payload or {}).get("elector_id_valid_count") or 0),
+                            "gender_filled_count": int((card_layout_debug_payload or {}).get("gender_filled_count") or 0),
+                            "records_partial_after_cleanup": int((card_layout_debug_payload or {}).get("records_partial_after_cleanup") or 0),
+                            "trusted_records_count": int((card_layout_debug_payload or {}).get("trusted_records_count") or 0),
+                            "needs_review_records_count": int((card_layout_debug_payload or {}).get("needs_review_records_count") or 0),
+                            "serial_low_confidence_count": int((card_layout_debug_payload or {}).get("serial_low_confidence_count") or 0),
+                            "elector_id_low_confidence_count": int((card_layout_debug_payload or {}).get("elector_id_low_confidence_count") or 0),
                         }
                     else:
                         st.session_state.name_search_test_run_summary = None
@@ -1689,16 +1824,42 @@ def show_name_search_workflow():
             {"Metric": "Replace existing enabled", "Value": "yes" if test_run_summary.get("replace_existing") else "no"},
             {"Metric": "Card parser mode", "Value": str(test_run_summary.get("card_layout_mode") or "")},
             {"Metric": "Card detection strategy", "Value": str(test_run_summary.get("card_detection_strategy") or "")},
-            {"Metric": "Cards detected", "Value": str(int(test_run_summary.get("cards_detected", 0)))},
-            {"Metric": "Cards OCR text", "Value": str(int(test_run_summary.get("cards_with_text", 0)))},
-            {"Metric": "Cards parsed to records (valid+partial)", "Value": str(int(test_run_summary.get("cards_parsed", 0)))},
+            {"Metric": "Expected slot count", "Value": str(int(test_run_summary.get("slots_expected", 0)))},
+            {"Metric": "Detected slot supports", "Value": str(int(test_run_summary.get("slots_detected_support", 0)))},
+            {"Metric": "OCR attempted slots", "Value": str(int(test_run_summary.get("slots_ocr_attempted", 0)))},
+            {"Metric": "Non-empty OCR slots", "Value": str(int(test_run_summary.get("cards_with_text", 0)))},
+            {"Metric": "Parsed slots (valid+partial)", "Value": str(int(test_run_summary.get("cards_parsed", 0)))},
             {"Metric": "Cards valid", "Value": str(int(test_run_summary.get("cards_valid", 0)))},
             {"Metric": "Cards partial", "Value": str(int(test_run_summary.get("cards_partial", 0)))},
             {"Metric": "Cards rejected", "Value": str(int(test_run_summary.get("cards_rejected", 0)))},
+            {"Metric": "Cards missing top fields", "Value": str(int(test_run_summary.get("cards_missing_top_fields", 0)))},
+            {"Metric": "Top-crop retries attempted", "Value": str(int(test_run_summary.get("cards_top_retry_attempted", 0)))},
+            {"Metric": "Top-crop retries used", "Value": str(int(test_run_summary.get("cards_top_retry_used", 0)))},
             {"Metric": "Cards inserted", "Value": str(int(test_run_summary.get("cards_inserted", 0)))},
-            {"Metric": "Expected cards (hint)", "Value": str(int(test_run_summary.get("expected_card_count", 0)))},
+            {"Metric": "Constituency parsed", "Value": "yes" if test_run_summary.get("constituency_parsed") else "no"},
+            {"Metric": "Section parsed", "Value": "yes" if test_run_summary.get("section_name_parsed") else "no"},
+            {"Metric": "Part number parsed", "Value": "yes" if test_run_summary.get("part_number_parsed") else "no"},
+            {
+                "Metric": "Records with propagated metadata",
+                "Value": f"{int(test_run_summary.get('records_metadata_propagated', 0))} / {int(test_run_summary.get('records_total_for_insert', 0))}",
+            },
+            {"Metric": "Serial number filled", "Value": str(int(test_run_summary.get("serial_number_filled_count", 0)))},
+            {"Metric": "Elector ID valid", "Value": str(int(test_run_summary.get("elector_id_valid_count", 0)))},
+            {"Metric": "Gender filled", "Value": str(int(test_run_summary.get("gender_filled_count", 0)))},
+            {"Metric": "Records partial after cleanup", "Value": str(int(test_run_summary.get("records_partial_after_cleanup", 0)))},
+            {"Metric": "Trusted records", "Value": str(int(test_run_summary.get("trusted_records_count", 0)))},
+            {"Metric": "Needs review records", "Value": str(int(test_run_summary.get("needs_review_records_count", 0)))},
+            {"Metric": "Serial low-confidence", "Value": str(int(test_run_summary.get("serial_low_confidence_count", 0)))},
+            {"Metric": "Elector ID low-confidence", "Value": str(int(test_run_summary.get("elector_id_low_confidence_count", 0)))},
         ]
         st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+
+        failed_slot_indexes = list(test_run_summary.get("failed_slot_indexes") or [])
+        if failed_slot_indexes:
+            st.warning(
+                "Missing/failed slot indexes: "
+                + ", ".join(str(int(index)) for index in failed_slot_indexes)
+            )
 
         reject_reason_breakdown = dict(test_run_summary.get("reject_reason_breakdown") or {})
         if reject_reason_breakdown:
@@ -1722,26 +1883,58 @@ def show_name_search_workflow():
             if detection_error:
                 st.caption(f"Detection note: {detection_error}")
 
+            st.markdown("#### Page Header Metadata")
+            header_bbox = dict(card_layout_debug_payload.get("header_bbox") or {})
+            if header_bbox:
+                st.caption(
+                    "header bbox: "
+                    + f"x1={header_bbox.get('x1', '')}, y1={header_bbox.get('y1', '')}, "
+                    + f"x2={header_bbox.get('x2', '')}, y2={header_bbox.get('y2', '')}"
+                )
+            header_crop_bytes = card_layout_debug_payload.get("header_crop_png_bytes")
+            if header_crop_bytes:
+                st.image(header_crop_bytes, caption="Header crop preview", width=420)
+            header_ocr_error = str(card_layout_debug_payload.get("header_ocr_error") or "")
+            if header_ocr_error:
+                st.caption(f"Header OCR note: {header_ocr_error}")
+            header_ocr_text = str(card_layout_debug_payload.get("header_ocr_text") or "")
+            if header_ocr_text:
+                st.markdown("Header OCR text")
+                st.code(header_ocr_text, language="text")
+            header_metadata = dict(card_layout_debug_payload.get("header_metadata") or {})
+            if header_metadata:
+                st.markdown("Parsed page metadata")
+                st.json(header_metadata)
+            propagated_count = int(card_layout_debug_payload.get("records_metadata_propagated") or 0)
+            propagated_total = int(card_layout_debug_payload.get("records_total_for_insert") or 0)
+            st.caption(
+                "Metadata propagation: "
+                + f"constituency={'yes' if bool(card_layout_debug_payload.get('constituency_parsed')) else 'no'} | "
+                + f"section={'yes' if bool(card_layout_debug_payload.get('section_name_parsed')) else 'no'} | "
+                + f"part_number={'yes' if bool(card_layout_debug_payload.get('part_number_parsed')) else 'no'} | "
+                + f"records={propagated_count}/{propagated_total}"
+            )
+
             cards_detected_value = int(card_layout_debug_payload.get("cards_detected") or 0)
+            slots_expected_value = int(card_layout_debug_payload.get("slots_expected") or 0)
+            slots_ocr_attempted_value = int(card_layout_debug_payload.get("slots_ocr_attempted") or 0)
             cards_parsed_value = int(card_layout_debug_payload.get("cards_parsed") or 0)
             cards_valid_value = int(card_layout_debug_payload.get("cards_valid") or 0)
             cards_partial_value = int(card_layout_debug_payload.get("cards_partial") or 0)
-            expected_cards_value = int(card_layout_debug_payload.get("expected_card_count") or 0)
-            if cards_detected_value >= 20 and cards_parsed_value < max(1, int(cards_detected_value * 0.6)):
+            if slots_expected_value > cards_parsed_value:
                 st.warning(
-                    f"Card completeness warning: detected {cards_detected_value} cards but only "
+                    f"Slot completeness warning: expected {slots_expected_value} slots but only "
                     f"{cards_parsed_value} records (valid+partial) were parsed."
-                )
-            if expected_cards_value >= 20 and cards_parsed_value < max(1, int(expected_cards_value * 0.6)):
-                st.warning(
-                    f"Expected around {expected_cards_value} cards for this page layout, "
-                    f"but only {cards_parsed_value} records (valid+partial) were parsed."
                 )
 
             st.caption(
-                f"Detected={cards_detected_value} | OCR text={int(card_layout_debug_payload.get('cards_with_text') or 0)} | "
+                f"ExpectedSlots={slots_expected_value} | DetectedSupports={cards_detected_value} | "
+                f"OCRAttempted={slots_ocr_attempted_value} | NonEmptyOCR={int(card_layout_debug_payload.get('cards_with_text') or 0)} | "
                 f"Valid={cards_valid_value} | Partial={cards_partial_value} | "
                 f"Rejected={int(card_layout_debug_payload.get('cards_rejected') or 0)} | "
+                f"MissingTop={int(card_layout_debug_payload.get('cards_missing_top_fields') or 0)} | "
+                f"TopRetries={int(card_layout_debug_payload.get('cards_top_retry_attempted') or 0)} | "
+                f"TopRetryUsed={int(card_layout_debug_payload.get('cards_top_retry_used') or 0)} | "
                 f"Inserted={int(card_layout_debug_payload.get('cards_inserted') or 0)}"
             )
 
@@ -1753,18 +1946,37 @@ def show_name_search_workflow():
                 ]
                 st.dataframe(reason_rows, use_container_width=True, hide_index=True)
 
+            failed_slots = list(card_layout_debug_payload.get("failed_slots") or [])
+            if failed_slots:
+                failed_rows = [
+                    {
+                        "Slot": int(slot.get("slot_index") or 0),
+                        "Status": str(slot.get("parse_status") or ""),
+                        "Reason": str(slot.get("reason") or ""),
+                        "Missing fields": ", ".join(str(field) for field in list(slot.get("missing_fields") or [])),
+                    }
+                    for slot in failed_slots
+                ]
+                st.dataframe(failed_rows, use_container_width=True, hide_index=True)
+
             preview_cards = list(card_layout_debug_payload.get("cards", []))
             if preview_cards:
                 for card_debug in preview_cards:
                     card_index = int(card_debug.get("card_index") or 0)
-                    bbox = card_debug.get("bbox") or {}
-                    bbox_text = (
-                        f"x1={bbox.get('x1', '')}, y1={bbox.get('y1', '')}, "
-                        f"x2={bbox.get('x2', '')}, y2={bbox.get('y2', '')}"
+                    original_bbox = card_debug.get("original_bbox") or {}
+                    expanded_bbox = card_debug.get("expanded_bbox") or card_debug.get("bbox") or {}
+                    original_bbox_text = (
+                        f"x1={original_bbox.get('x1', '')}, y1={original_bbox.get('y1', '')}, "
+                        f"x2={original_bbox.get('x2', '')}, y2={original_bbox.get('y2', '')}"
+                    )
+                    expanded_bbox_text = (
+                        f"x1={expanded_bbox.get('x1', '')}, y1={expanded_bbox.get('y1', '')}, "
+                        f"x2={expanded_bbox.get('x2', '')}, y2={expanded_bbox.get('y2', '')}"
                     )
                     accepted_text = "yes" if bool(card_debug.get("accepted")) else "no"
                     st.markdown(f"#### Card #{card_index} | accepted: {accepted_text}")
-                    st.caption(f"bbox: {bbox_text}")
+                    st.caption(f"original bbox: {original_bbox_text}")
+                    st.caption(f"expanded bbox: {expanded_bbox_text}")
 
                     crop_bytes = card_debug.get("crop_png_bytes")
                     if crop_bytes:
@@ -1774,19 +1986,42 @@ def show_name_search_workflow():
                     parse_status = str(card_debug.get("parse_status") or validation_status)
                     reject_reason = str(card_debug.get("reject_reason") or "")
                     db_insert_status = str(card_debug.get("db_insert_status") or "")
-                    ocr_preprocess = str(card_debug.get("ocr_preprocess") or "")
+                    ocr_preprocess = card_debug.get("ocr_preprocess")
                     status_parts = [
                         f"parse: {parse_status or 'unknown'}",
                         f"db: {db_insert_status or 'unknown'}",
                     ]
                     if ocr_preprocess:
                         status_parts.append(f"ocr preprocess: {ocr_preprocess}")
+                    if bool(card_debug.get("top_retry_attempted")):
+                        status_parts.append("top retry attempted")
+                    if bool(card_debug.get("top_retry_used")):
+                        status_parts.append("top retry used")
                     if reject_reason:
                         status_parts.append(f"reject reason: {reject_reason}")
                     st.caption(" | ".join(status_parts))
 
                     raw_ocr_text = str(card_debug.get("raw_ocr_text") or "")
                     cleaned_ocr_text = str(card_debug.get("cleaned_ocr_text") or "")
+                    serial_zone_ocr_text = str(card_debug.get("serial_zone_ocr_text") or "")
+                    serial_zone_digits_ocr_text = str(card_debug.get("serial_zone_digits_ocr_text") or "")
+                    serial_zone_verify_ocr_text = str(card_debug.get("serial_zone_verify_ocr_text") or "")
+                    elector_zone_ocr_text = str(card_debug.get("elector_zone_ocr_text") or "")
+                    elector_zone_verify_ocr_text = str(card_debug.get("elector_zone_verify_ocr_text") or "")
+                    body_zone_ocr_text = str(card_debug.get("body_zone_ocr_text") or "")
+                    cleaned_serial_number = str(card_debug.get("cleaned_serial_number") or "")
+                    cleaned_elector_id = str(card_debug.get("cleaned_elector_id") or "")
+                    serial_candidates = list(card_debug.get("serial_candidates") or [])
+                    elector_candidates = list(card_debug.get("elector_candidates") or [])
+                    serial_confidence = str(card_debug.get("serial_confidence") or "")
+                    serial_confidence_reason = str(card_debug.get("serial_confidence_reason") or "")
+                    elector_confidence = str(card_debug.get("elector_confidence") or "")
+                    elector_confidence_reason = str(card_debug.get("elector_confidence_reason") or "")
+                    record_status = str(card_debug.get("record_status") or "")
+                    record_status_reason = str(card_debug.get("record_status_reason") or "")
+                    normalized_labels_detected = list(card_debug.get("normalized_labels_detected") or [])
+                    field_parse_quality = dict(card_debug.get("field_parse_quality") or {})
+                    missing_fields = list(card_debug.get("missing_fields") or [])
                     if raw_ocr_text:
                         st.markdown("Raw OCR text")
                         st.code(raw_ocr_text, language="text")
@@ -1796,6 +2031,50 @@ def show_name_search_workflow():
                     if cleaned_ocr_text:
                         st.markdown("Cleaned OCR text")
                         st.code(cleaned_ocr_text, language="text")
+                    if serial_zone_ocr_text:
+                        st.markdown("Serial zone OCR")
+                        st.code(serial_zone_ocr_text, language="text")
+                    if serial_zone_digits_ocr_text:
+                        st.markdown("Serial zone OCR (digits-only)")
+                        st.code(serial_zone_digits_ocr_text, language="text")
+                    if serial_zone_verify_ocr_text:
+                        st.markdown("Serial zone OCR (verification pass B)")
+                        st.code(serial_zone_verify_ocr_text, language="text")
+                    if elector_zone_ocr_text:
+                        st.markdown("Elector ID zone OCR")
+                        st.code(elector_zone_ocr_text, language="text")
+                    if elector_zone_verify_ocr_text:
+                        st.markdown("Elector ID zone OCR (verification pass B)")
+                        st.code(elector_zone_verify_ocr_text, language="text")
+                    if body_zone_ocr_text:
+                        st.markdown("Body zone OCR")
+                        st.code(body_zone_ocr_text, language="text")
+                    if cleaned_serial_number or cleaned_elector_id:
+                        st.caption(
+                            "Chosen sensitive fields: "
+                            + f"serial_number={cleaned_serial_number or 'null'} ({serial_confidence or 'unknown'}) | "
+                            + f"elector_id={cleaned_elector_id or 'null'} ({elector_confidence or 'unknown'})"
+                        )
+                    if serial_confidence_reason or elector_confidence_reason:
+                        st.caption(
+                            "Confidence reasons: "
+                            + f"serial={serial_confidence_reason or 'n/a'} | "
+                            + f"elector_id={elector_confidence_reason or 'n/a'}"
+                        )
+                    if record_status:
+                        st.caption(
+                            f"Record trust status: {record_status}"
+                            + (f" ({record_status_reason})" if record_status_reason else "")
+                        )
+                    if serial_candidates:
+                        st.caption("Serial candidates: " + ", ".join(str(value) for value in serial_candidates))
+                    if elector_candidates:
+                        st.caption("Elector candidates: " + ", ".join(str(value) for value in elector_candidates))
+                    if normalized_labels_detected:
+                        st.caption("Normalized labels: " + ", ".join(normalized_labels_detected))
+                    if field_parse_quality:
+                        st.markdown("Field parse quality")
+                        st.json(field_parse_quality)
 
                     parsed_record = card_debug.get("parsed_record")
                     if parsed_record:
@@ -1803,6 +2082,8 @@ def show_name_search_workflow():
                         st.json(parsed_record)
                     else:
                         st.caption(f"Skipped card reason: {reject_reason or 'not parsed'}")
+                    if missing_fields:
+                        st.caption(f"Missing fields: {', '.join(missing_fields)}")
             else:
                 st.info("No card-level debug rows captured for this page.")
 
