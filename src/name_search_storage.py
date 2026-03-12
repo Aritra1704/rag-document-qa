@@ -8,6 +8,7 @@ import io
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any, Iterable, Sequence
 from urllib.parse import quote_plus
 try:
@@ -34,6 +35,30 @@ INDEX_SQL_PATH = Path(__file__).resolve().parent.parent / "db" / "postgres" / "0
 PROJECT_SCHEMA = "rag_document_qa"
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 _ENV_LOADED = False
+_CV2_MODULE = None
+_NP_MODULE = None
+_CV2_IMPORT_ERROR: str | None = None
+
+
+def _load_cv2_numpy():
+    global _CV2_MODULE
+    global _NP_MODULE
+    global _CV2_IMPORT_ERROR
+    if _CV2_MODULE is not None and _NP_MODULE is not None:
+        return _CV2_MODULE, _NP_MODULE, None
+    if _CV2_IMPORT_ERROR is not None:
+        return None, None, _CV2_IMPORT_ERROR
+
+    try:
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        _CV2_IMPORT_ERROR = str(exc)
+        return None, None, _CV2_IMPORT_ERROR
+
+    _CV2_MODULE = cv2
+    _NP_MODULE = np
+    return _CV2_MODULE, _NP_MODULE, None
 
 
 def _load_local_env() -> None:
@@ -763,19 +788,32 @@ def _render_pdf_page_image(file_path: str, page_number: int):
                 pass
 
 
+def _float_env(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        parsed_value = float(raw_value)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, parsed_value))
+
+
 def _build_grid_card_boxes(width: int, height: int) -> list[tuple[int, int, int, int]]:
     cols = 3
-    rows = 10
     margin_x = int(width * 0.03)
     top_margin = int(height * 0.18)
     bottom_margin = int(height * 0.03)
     gap_x = max(4, int(width * 0.008))
-    gap_y = max(4, int(height * 0.006))
 
     usable_width = max(10, width - (2 * margin_x) - (gap_x * (cols - 1)))
-    usable_height = max(10, height - top_margin - bottom_margin - (gap_y * (rows - 1)))
     box_width = max(10, usable_width // cols)
-    box_height = max(10, usable_height // rows)
+    estimated_box_height = max(10, int(box_width / 2.0))
+    usable_height = max(10, height - top_margin - bottom_margin)
+    rows = max(7, min(11, int(round(usable_height / max(estimated_box_height, 1)))))
+    gap_y = max(4, int(height * 0.005))
+    usable_height_with_gaps = max(10, usable_height - (gap_y * (rows - 1)))
+    box_height = max(10, usable_height_with_gaps // rows)
 
     boxes: list[tuple[int, int, int, int]] = []
     for row_index in range(rows):
@@ -823,121 +861,578 @@ def _dedupe_boxes(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int
     return kept_boxes
 
 
-def _detect_voter_card_boxes(page_image) -> tuple[list[tuple[int, int, int, int]], str, str | None]:
-    width, height = page_image.size
-    fallback_boxes = _build_grid_card_boxes(width, height)
-    try:
-        import cv2
-        import numpy as np
-    except Exception as exc:  # noqa: BLE001
-        return fallback_boxes, "grid_fallback", f"opencv unavailable: {exc}"
+def _expand_box(
+    box: tuple[int, int, int, int],
+    *,
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    pad_left_ratio = _float_env("NAME_SEARCH_CARD_PAD_LEFT", 0.02, minimum=0.0, maximum=0.1)
+    pad_right_ratio = _float_env("NAME_SEARCH_CARD_PAD_RIGHT", 0.02, minimum=0.0, maximum=0.1)
+    pad_top_ratio = _float_env("NAME_SEARCH_CARD_PAD_TOP", 0.03, minimum=0.0, maximum=0.12)
+    pad_bottom_ratio = _float_env("NAME_SEARCH_CARD_PAD_BOTTOM", 0.05, minimum=0.0, maximum=0.15)
+    x1, y1, x2, y2 = box
+    box_width = max(1, x2 - x1)
+    box_height = max(1, y2 - y1)
+    expanded_x1 = max(0, int(round(x1 - (box_width * pad_left_ratio))))
+    expanded_x2 = min(width, int(round(x2 + (box_width * pad_right_ratio))))
+    expanded_y1 = max(0, int(round(y1 - (box_height * pad_top_ratio))))
+    expanded_y2 = min(height, int(round(y2 + (box_height * pad_bottom_ratio))))
+    return expanded_x1, expanded_y1, expanded_x2, expanded_y2
 
-    try:
-        gray_image = np.array(page_image.convert("L"))
-        blurred = cv2.GaussianBlur(gray_image, (5, 5), 0)
-        thresholded = cv2.adaptiveThreshold(
-            blurred,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            35,
-            12,
-        )
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        morphed = cv2.morphologyEx(thresholded, cv2.MORPH_CLOSE, kernel, iterations=2)
-        contours, _ = cv2.findContours(morphed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    except Exception as exc:  # noqa: BLE001
-        return fallback_boxes, "grid_fallback", f"opencv detection failed: {exc}"
 
+def _filter_boxes_by_area(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    if len(boxes) < 6:
+        return boxes
+    areas = [(box[2] - box[0]) * (box[3] - box[1]) for box in boxes]
+    median_area = median(areas)
+    min_area = median_area * 0.45
+    max_area = median_area * 2.4
+    return [box for box, area in zip(boxes, areas) if min_area <= area <= max_area]
+
+
+def _kmeans_1d(values: Sequence[float], cluster_count: int, max_iter: int = 12) -> list[float]:
+    if not values:
+        return []
+    sorted_values = sorted(float(value) for value in values)
+    if len(sorted_values) <= cluster_count:
+        return sorted_values
+
+    centers = []
+    last_index = len(sorted_values) - 1
+    for cluster_index in range(cluster_count):
+        quantile = cluster_index / max(cluster_count - 1, 1)
+        seed_index = int(round(quantile * last_index))
+        centers.append(sorted_values[seed_index])
+
+    for _ in range(max_iter):
+        groups: list[list[float]] = [[] for _ in range(cluster_count)]
+        for value in sorted_values:
+            nearest = min(range(cluster_count), key=lambda idx: abs(value - centers[idx]))
+            groups[nearest].append(value)
+        new_centers = []
+        for index, group in enumerate(groups):
+            if group:
+                new_centers.append(sum(group) / len(group))
+            else:
+                new_centers.append(centers[index])
+        shift = max(abs(new_centers[index] - centers[index]) for index in range(cluster_count))
+        centers = new_centers
+        if shift < 1.0:
+            break
+    return sorted(centers)
+
+
+def _compress_column_duplicates(boxes: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    if len(boxes) < 10:
+        return boxes
+    heights = [max(1, box[3] - box[1]) for box in boxes]
+    median_height = median(heights)
+    x_centers = [((box[0] + box[2]) / 2.0) for box in boxes]
+    column_centers = _kmeans_1d(x_centers, cluster_count=3)
+    if len(column_centers) < 3:
+        return boxes
+
+    columns: list[list[tuple[int, int, int, int]]] = [[] for _ in range(3)]
+    for box in boxes:
+        center_x = (box[0] + box[2]) / 2.0
+        nearest_col = min(range(3), key=lambda idx: abs(center_x - column_centers[idx]))
+        columns[nearest_col].append(box)
+
+    compressed: list[tuple[int, int, int, int]] = []
+    y_merge_threshold = max(8, int(round(median_height * 0.5)))
+    for column_boxes in columns:
+        if not column_boxes:
+            continue
+        sorted_by_y = sorted(column_boxes, key=lambda box: (box[1] + box[3]) / 2.0)
+        groups: list[list[tuple[int, int, int, int]]] = []
+        for box in sorted_by_y:
+            center_y = (box[1] + box[3]) / 2.0
+            if not groups:
+                groups.append([box])
+                continue
+            last_group = groups[-1]
+            last_center_y = (last_group[-1][1] + last_group[-1][3]) / 2.0
+            if abs(center_y - last_center_y) <= y_merge_threshold:
+                last_group.append(box)
+            else:
+                groups.append([box])
+        for group in groups:
+            largest_box = max(group, key=lambda item: (item[2] - item[0]) * (item[3] - item[1]))
+            compressed.append(largest_box)
+    return compressed
+
+
+def _extract_boxes_from_mask(
+    mask_image,
+    *,
+    width: int,
+    height: int,
+    cv2_module,
+) -> list[tuple[int, int, int, int]]:
+    contours, _ = cv2_module.findContours(mask_image, cv2_module.RETR_EXTERNAL, cv2_module.CHAIN_APPROX_SIMPLE)
     page_area = max(1, width * height)
     candidate_boxes: list[tuple[int, int, int, int]] = []
     for contour in contours:
-        x, y, box_width, box_height = cv2.boundingRect(contour)
+        x, y, box_width, box_height = cv2_module.boundingRect(contour)
         area = box_width * box_height
-        if area < page_area * 0.003:
+        if area < page_area * 0.0018:
             continue
-        if box_width < width * 0.14 or box_height < height * 0.04:
+        if area > page_area * 0.11:
             continue
-        if y < int(height * 0.12):
+        if box_width < width * 0.16 or box_width > width * 0.45:
+            continue
+        if box_height < height * 0.045 or box_height > height * 0.20:
+            continue
+        if y < int(height * 0.10):
             continue
         ratio = box_width / max(box_height, 1)
-        if ratio < 0.85 or ratio > 5.0:
+        if ratio < 0.95 or ratio > 4.8:
             continue
         candidate_boxes.append((x, y, x + box_width, y + box_height))
-
-    deduped_boxes = _dedupe_boxes(candidate_boxes)
-    if 4 <= len(deduped_boxes) <= 80:
-        return deduped_boxes, "opencv_contours", None
-    return fallback_boxes, "grid_fallback", "opencv detected too few/many boxes"
+    return candidate_boxes
 
 
-def _ocr_card_image(card_image, timeout_seconds: float | None) -> tuple[str, str | None]:
+def _detect_voter_card_boxes(page_image) -> tuple[list[tuple[int, int, int, int]], str, str | None]:
+    width, height = page_image.size
+    fallback_boxes = _build_grid_card_boxes(width, height)
+    cv2_module, np_module, cv2_error = _load_cv2_numpy()
+    if cv2_module is None or np_module is None:
+        return (
+            fallback_boxes,
+            "grid_fallback",
+            f"opencv unavailable: {cv2_error}. Install dependencies in the active environment (`pip install -r requirements.txt`).",
+        )
+
+    try:
+        gray_image = np_module.array(page_image.convert("L"))
+        blurred = cv2_module.GaussianBlur(gray_image, (5, 5), 0)
+        thresholded = cv2_module.adaptiveThreshold(
+            blurred,
+            255,
+            cv2_module.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2_module.THRESH_BINARY_INV,
+            35,
+            12,
+        )
+
+        close_kernel = cv2_module.getStructuringElement(cv2_module.MORPH_RECT, (7, 7))
+        closed_mask = cv2_module.morphologyEx(thresholded, cv2_module.MORPH_CLOSE, close_kernel, iterations=1)
+
+        horizontal_kernel = cv2_module.getStructuringElement(
+            cv2_module.MORPH_RECT,
+            (max(25, int(width * 0.08)), 1),
+        )
+        vertical_kernel = cv2_module.getStructuringElement(
+            cv2_module.MORPH_RECT,
+            (1, max(25, int(height * 0.04))),
+        )
+        horizontal_lines = cv2_module.morphologyEx(thresholded, cv2_module.MORPH_OPEN, horizontal_kernel, iterations=1)
+        vertical_lines = cv2_module.morphologyEx(thresholded, cv2_module.MORPH_OPEN, vertical_kernel, iterations=1)
+        grid_mask = cv2_module.bitwise_or(horizontal_lines, vertical_lines)
+        combined_mask = cv2_module.bitwise_or(closed_mask, grid_mask)
+
+        contour_candidates = _extract_boxes_from_mask(
+            combined_mask,
+            width=width,
+            height=height,
+            cv2_module=cv2_module,
+        )
+        line_candidates = _extract_boxes_from_mask(
+            grid_mask,
+            width=width,
+            height=height,
+            cv2_module=cv2_module,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return fallback_boxes, "grid_fallback", f"opencv detection failed: {exc}"
+
+    candidate_boxes = _dedupe_boxes(contour_candidates + line_candidates)
+    candidate_boxes = _filter_boxes_by_area(candidate_boxes)
+    candidate_boxes = _compress_column_duplicates(candidate_boxes)
+    candidate_boxes = _dedupe_boxes(candidate_boxes)
+
+    if 12 <= len(candidate_boxes) <= 42:
+        expanded_boxes = [
+            _expand_box(box, width=width, height=height)
+            for box in candidate_boxes
+        ]
+        return expanded_boxes, "opencv_layout", None
+    return fallback_boxes, "grid_fallback", "opencv detected unstable card layout; using grid fallback"
+
+
+def _preprocess_card_for_ocr(card_image):
+    from PIL import Image
+
+    cv2_module, np_module, _ = _load_cv2_numpy()
+    source_image = card_image.convert("RGB")
+    if cv2_module is None or np_module is None:
+        gray_image = source_image.convert("L")
+        scale_factor = 2.0 if gray_image.width < 900 else 1.5 if gray_image.width < 1200 else 1.0
+        if scale_factor > 1.0:
+            gray_image = gray_image.resize(
+                (
+                    int(gray_image.width * scale_factor),
+                    int(gray_image.height * scale_factor),
+                ),
+                Image.Resampling.LANCZOS,
+            )
+        return gray_image, f"pil_gray_resize_x{scale_factor:.1f}"
+
+    rgb_array = np_module.array(source_image)
+    gray_array = cv2_module.cvtColor(rgb_array, cv2_module.COLOR_RGB2GRAY)
+
+    scale_factor = _float_env("NAME_SEARCH_OCR_SCALE", 1.6, minimum=1.0, maximum=3.0)
+    if gray_array.shape[1] >= 1400:
+        scale_factor = min(scale_factor, 1.2)
+    elif gray_array.shape[1] >= 1000:
+        scale_factor = min(scale_factor, 1.4)
+    if scale_factor > 1.0:
+        gray_array = cv2_module.resize(
+            gray_array,
+            None,
+            fx=scale_factor,
+            fy=scale_factor,
+            interpolation=cv2_module.INTER_CUBIC,
+        )
+
+    denoised = cv2_module.bilateralFilter(gray_array, 7, 45, 45)
+    thresholded = cv2_module.adaptiveThreshold(
+        denoised,
+        255,
+        cv2_module.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2_module.THRESH_BINARY,
+        31,
+        8,
+    )
+    open_kernel = cv2_module.getStructuringElement(cv2_module.MORPH_RECT, (2, 2))
+    cleaned = cv2_module.morphologyEx(thresholded, cv2_module.MORPH_OPEN, open_kernel, iterations=1)
+    return Image.fromarray(cleaned), f"opencv_gray_adaptivethresh_x{scale_factor:.1f}"
+
+
+def _ocr_text_score(text: str) -> tuple[int, int]:
+    normalized = str(text or "")
+    return (
+        sum(char.isalnum() for char in normalized),
+        len(normalized.strip()),
+    )
+
+
+def _run_tesseract(image, *, timeout_seconds: float | None, config: str):
+    import pytesseract
+
+    if timeout_seconds is not None and timeout_seconds > 0:
+        return pytesseract.image_to_string(
+            image,
+            timeout=float(timeout_seconds),
+            config=config,
+        ) or ""
+    return pytesseract.image_to_string(
+        image,
+        config=config,
+    ) or ""
+
+
+def _ocr_card_image(card_image, timeout_seconds: float | None) -> tuple[str, str | None, dict[str, Any]]:
     try:
         import pytesseract
     except Exception as exc:  # noqa: BLE001
-        return "", f"pytesseract import failed: {exc}"
+        return "", f"pytesseract import failed: {exc}", {"preprocess": "none"}
 
     tesseract_path = shutil.which("tesseract")
     if not tesseract_path:
-        return "", "tesseract command not found"
+        return "", "tesseract command not found", {"preprocess": "none"}
 
     try:
         pytesseract.pytesseract.tesseract_cmd = tesseract_path
     except Exception:  # noqa: BLE001
         pass
 
+    preprocessed_image, preprocess_note = _preprocess_card_for_ocr(card_image)
+    ocr_meta = {
+        "preprocess": preprocess_note,
+        "attempts": [],
+    }
+
     try:
-        if timeout_seconds is not None and timeout_seconds > 0:
-            text = pytesseract.image_to_string(
-                card_image,
-                timeout=float(timeout_seconds),
-                config="--oem 1 --psm 6",
-            ) or ""
-        else:
-            text = pytesseract.image_to_string(
-                card_image,
-                config="--oem 1 --psm 6",
-            ) or ""
+        processed_text = _run_tesseract(preprocessed_image, timeout_seconds=timeout_seconds, config="--oem 1 --psm 6")
+        raw_text = _run_tesseract(card_image, timeout_seconds=timeout_seconds, config="--oem 1 --psm 11")
+        ocr_meta["attempts"] = [
+            {"source": "preprocessed", "config": "psm6", "score": _ocr_text_score(processed_text)},
+            {"source": "raw", "config": "psm11", "score": _ocr_text_score(raw_text)},
+        ]
+        text = processed_text if _ocr_text_score(processed_text) >= _ocr_text_score(raw_text) else raw_text
     except RuntimeError as exc:
         if "time" in str(exc).lower():
             timeout_display = int(timeout_seconds) if timeout_seconds else "configured"
-            return "", f"ocr timeout after {timeout_display}s"
-        return "", f"ocr failed: {exc}"
+            return "", f"ocr timeout after {timeout_display}s", ocr_meta
+        return "", f"ocr failed: {exc}", ocr_meta
     except Exception as exc:  # noqa: BLE001
-        return "", f"ocr failed: {exc}"
+        return "", f"ocr failed: {exc}", ocr_meta
 
-    return text, None
+    return text, None, ocr_meta
 
 
 def _clean_card_field(raw_value: str) -> str:
-    cleaned = " ".join(raw_value.split())
+    cleaned = re.sub(r"\s+", " ", str(raw_value or "")).strip()
+    cleaned = re.sub(r"^[^A-Za-z0-9]+", "", cleaned)
     cleaned = re.sub(
-        r"\b(?:house|gender|age|sex|epic|elector|constituency|section)\b.*$",
+        r"(?i)\b(?:father|mother|husband|wife)(?:'?s)?\s+name\b.*$",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"\b(?:house|gender|age|sex|epic|elector|constituency|section|photo|available|poc|relation)\b.*$",
         "",
         cleaned,
         flags=re.IGNORECASE,
     )
-    cleaned = cleaned.strip(" :|-")
+    cleaned = cleaned.strip(" :|-.,")
     return cleaned[:160]
 
 
-def _infer_card_name(card_text: str, elector_id: str) -> str:
-    for raw_line in card_text.replace("\r", "\n").splitlines():
-        line = " ".join(raw_line.split()).strip()
+def _clean_card_ocr_text(raw_text: str) -> str:
+    normalized_text = str(raw_text or "").replace("\r", "\n")
+    cleaned_lines: list[str] = []
+    for raw_line in normalized_text.splitlines():
+        line = raw_line
+        line = line.replace("“", '"').replace("”", '"').replace("’", "'").replace("`", "'")
+        line = line.replace("¦", "|")
+        line = re.sub(r"[#?+]+", " ", line)
+        line = re.sub(r"\s+", " ", line).strip(" -:|")
         if not line:
             continue
+        lowered = line.lower()
+        if any(
+            noise in lowered
+            for noise in [
+                "photo",
+                "available",
+                "poc",
+                "assembly constituency",
+                "constituency no",
+                "section name",
+                "part no",
+                "electoral roll",
+            ]
+        ):
+            continue
+        if re.fullmatch(r"[\W_]+", line):
+            continue
+        cleaned_lines.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned_lines)).strip()
+
+
+def _extract_labeled_value(cleaned_text: str, label_patterns: Sequence[str]) -> str:
+    lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        for label_pattern in label_patterns:
+            label_match = re.search(
+                rf"(?i)\b{label_pattern}\b(?:\s*name)?\s*[:\-]?\s*(.*)$",
+                line,
+            )
+            if not label_match:
+                continue
+            immediate_value = _clean_card_field(label_match.group(1))
+            if immediate_value:
+                return immediate_value
+            if index + 1 < len(lines):
+                next_line_value = _clean_card_field(lines[index + 1])
+                if next_line_value:
+                    return next_line_value
+    return ""
+
+
+def _parse_serial_number(cleaned_text: str) -> str:
+    labeled_serial = _extract_labeled_value(
+        cleaned_text,
+        [r"serial", r"sl\.?\s*no\.?", r"sr\.?\s*no\.?", r"क्रमांक"],
+    )
+    if labeled_serial and re.search(r"\d", labeled_serial):
+        match = re.search(r"\b(\d{1,5})\b", labeled_serial)
+        if match:
+            return match.group(1)
+
+    lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+    for line in lines:
+        if any(token in line.lower() for token in ["age", "gender", "sex", "house", "father", "mother", "husband"]):
+            continue
+        serial_with_epic = re.search(
+            r"^\s*(\d{1,5})\s+(?:[A-Z]{2,4}\d{6,10}|[A-Z]{1,3}/\d{1,3}/\d{1,3}/\d{3,8}|[A-Z]{1,4}[-/]\d{6,10})\b",
+            line.upper(),
+        )
+        if serial_with_epic:
+            return serial_with_epic.group(1)
+
+    if lines:
+        first_line_match = re.match(r"^(\d{1,5})\b", lines[0])
+        if first_line_match:
+            return first_line_match.group(1)
+    for line in lines:
+        if re.fullmatch(r"\d{1,5}", line):
+            return line
+    return ""
+
+
+def _parse_elector_id(cleaned_text: str) -> str:
+    labeled_id = _extract_labeled_value(
+        cleaned_text,
+        [r"epic", r"elector\s*id", r"voter\s*id", r"id\s*no\.?", r"card\s*no\.?"],
+    )
+    if labeled_id:
+        normalized_labeled = re.sub(r"\s+", "", labeled_id.upper())
+        if re.fullmatch(r"(?:[A-Z]{2,4}\d{6,10}|[A-Z]{1,3}/\d{1,3}/\d{1,3}/\d{3,8}|[A-Z]{1,4}[-/]\d{6,10})", normalized_labeled):
+            return normalized_labeled
+
+    upper_text = cleaned_text.upper()
+    patterns = [
+        r"([A-Z]{2,4}\s*\d{6,10})",
+        r"([A-Z]{1,3}\s*/\s*\d{1,3}\s*/\s*\d{1,3}\s*/\s*\d{3,8})",
+        r"([A-Z]{1,4}\s*[-/]\s*\d{6,10})",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, upper_text):
+            candidate = match.group(1)
+            normalized = re.sub(r"\s+", "", candidate)
+            normalized = re.sub(r"\s*/\s*", "/", normalized)
+            normalized = re.sub(r"\s*-\s*", "-", normalized)
+            digit_count = sum(char.isdigit() for char in normalized)
+            if digit_count >= 6:
+                return normalized
+    return ""
+
+
+def _parse_relative_fields(cleaned_text: str) -> tuple[str, str]:
+    relative_patterns: list[tuple[str, str]] = [
+        ("father", r"father(?:'?s)?"),
+        ("husband", r"husband(?:'?s)?"),
+        ("mother", r"mother(?:'?s)?"),
+        ("husband", r"wife(?:'?s)?"),
+    ]
+    for normalized_type, pattern in relative_patterns:
+        relative_name = _extract_labeled_value(cleaned_text, [pattern])
+        if relative_name:
+            return normalized_type, relative_name
+        for line in cleaned_text.splitlines():
+            reverse_match = re.search(
+                rf"(?i)^\s*([A-Za-z][A-Za-z .']{{1,120}}?)\s+{pattern}\s*(?:name)?\s*$",
+                line.strip(),
+            )
+            if reverse_match:
+                candidate = _clean_card_field(reverse_match.group(1))
+                if candidate:
+                    return normalized_type, candidate
+
+    shorthand_match = re.search(
+        r"(?im)\b(S/O|W/O|D/O)\b\s*[:\-]?\s*([^\n]{2,120})",
+        cleaned_text,
+    )
+    if shorthand_match:
+        token = shorthand_match.group(1).upper()
+        relative_name = _clean_card_field(shorthand_match.group(2))
+        if token == "S/O":
+            return "father", relative_name
+        if token == "W/O":
+            return "husband", relative_name
+        if token == "D/O":
+            return "mother", relative_name
+    return "", ""
+
+
+def _parse_house_number(cleaned_text: str) -> str:
+    house_value = _extract_labeled_value(
+        cleaned_text,
+        [r"house\s*(?:no\.?|number)?", r"h\.?\s*no\.?", r"house"],
+    )
+    if house_value:
+        return _clean_card_field(house_value)
+
+    fallback_match = re.search(r"(?im)\b(?:h\.?\s*no\.?|house)\b\W*([A-Za-z0-9/\- ]{1,40})", cleaned_text)
+    if fallback_match:
+        return _clean_card_field(fallback_match.group(1))
+    shorthand_match = re.search(r"(?im)\bHN\b\W*([A-Za-z0-9/\- ]{1,40})", cleaned_text)
+    if shorthand_match:
+        return _clean_card_field(shorthand_match.group(1))
+    return ""
+
+
+def _parse_age_and_gender(cleaned_text: str) -> tuple[int | None, str]:
+    age = None
+    age_match = re.search(r"(?im)\b(?:age)\b\s*[:\-]?\s*(\d{1,3})", cleaned_text)
+    if age_match and age_match.group(1).isdigit():
+        age = int(age_match.group(1))
+    if age is None:
+        fallback_age = re.search(r"(?im)\b(\d{1,3})\b\s*(?:yrs?|years?)\b", cleaned_text)
+        if fallback_age and fallback_age.group(1).isdigit():
+            age = int(fallback_age.group(1))
+    if age is None:
+        fallback_age = re.search(r"(?im)\b(\d{1,3})\s*/\s*(male|female|other|m|f)\b", cleaned_text)
+        if fallback_age and fallback_age.group(1).isdigit():
+            age = int(fallback_age.group(1))
+    if age is None:
+        fallback_age = re.search(r"(?im)\b(?:male|female|other|m|f)\s*/\s*(\d{1,3})\b", cleaned_text)
+        if fallback_age and fallback_age.group(1).isdigit():
+            age = int(fallback_age.group(1))
+
+    gender = ""
+    gender_match = re.search(r"(?im)\b(?:gender|sex)\b\s*[:\-]?\s*(male|female|other|m|f)\b", cleaned_text)
+    if not gender_match:
+        gender_match = re.search(r"(?im)\b(male|female|other)\b", cleaned_text)
+    if gender_match:
+        gender = gender_match.group(1).lower()
+    if not gender:
+        fallback_gender = re.search(r"(?im)\b(\d{1,3})\s*/\s*(male|female|other|m|f)\b", cleaned_text)
+        if fallback_gender:
+            gender = fallback_gender.group(2).lower()
+    if not gender:
+        fallback_gender = re.search(r"(?im)\b(?:male|female|other|m|f)\s*/\s*(\d{1,3})\b", cleaned_text)
+        if fallback_gender:
+            gender = fallback_gender.group(0).split("/")[0].strip().lower()
+    if gender == "m":
+        gender = "male"
+    elif gender == "f":
+        gender = "female"
+    return age, gender
+
+
+def _is_noise_name(name_value: str) -> bool:
+    name = _clean_card_field(name_value).lower()
+    if not name:
+        return True
+    if name in {"photo", "available", "poc"}:
+        return True
+    if any(
+        token in name
+        for token in [
+            "assembly constituency",
+            "constituency no",
+            "section name",
+            "part no",
+            "electoral roll",
+            "hous",
+            "gender",
+            "age",
+            "father name",
+            "husband name",
+            "mother name",
+        ]
+    ):
+        return True
+    alpha_chars = sum(char.isalpha() for char in name)
+    return alpha_chars < 3
+
+
+def _infer_card_name(cleaned_text: str, elector_id: str) -> str:
+    lines = [line.strip() for line in cleaned_text.splitlines() if line.strip()]
+    for line in lines:
         lower_line = line.lower()
-        if elector_id and elector_id in line:
+        if elector_id and elector_id in line.replace(" ", ""):
             continue
         if re.match(r"^\d{1,5}\b", line):
             continue
         if any(
             token in lower_line
             for token in [
-                "assembly constituency",
-                "constituency no",
-                "part no",
-                "name of",
                 "father",
                 "mother",
                 "husband",
@@ -948,109 +1443,98 @@ def _infer_card_name(card_text: str, elector_id: str) -> str:
                 "sex",
                 "epic",
                 "elector",
+                "serial",
+                "sl no",
             ]
         ):
             continue
-        alpha_ratio = sum(char.isalpha() for char in line) / max(len(line), 1)
-        if alpha_ratio >= 0.55:
-            return line[:120]
+        candidate = _clean_card_field(line)
+        if _is_noise_name(candidate):
+            continue
+        alpha_ratio = sum(char.isalpha() for char in candidate) / max(len(candidate), 1)
+        if alpha_ratio >= 0.6:
+            return candidate[:120]
     return ""
+
+
+def _classify_card_record(record: dict[str, Any]) -> tuple[str, str]:
+    name_value = str(record.get("name") or "").strip()
+    if not name_value or _is_noise_name(name_value):
+        return "rejected", "invalid/noisy name"
+
+    elector_id_value = str(record.get("elector_id") or "").strip()
+    if elector_id_value and not re.fullmatch(
+        r"(?:[A-Z]{2,4}\d{6,10}|[A-Z]{1,3}/\d{1,3}/\d{1,3}/\d{3,8}|[A-Z]{1,4}[-/]\d{6,10})",
+        elector_id_value,
+    ):
+        return "rejected", "invalid elector_id format"
+
+    serial_number_value = str(record.get("serial_number") or "").strip()
+    if serial_number_value and not re.fullmatch(r"\d{1,5}", serial_number_value):
+        return "rejected", "invalid serial_number format"
+
+    primary_fields_present = sum(
+        [
+            1 if elector_id_value else 0,
+            1 if serial_number_value else 0,
+            1 if str(record.get("house_number") or "").strip() else 0,
+            1 if record.get("age") is not None else 0,
+        ]
+    )
+    secondary_fields_present = sum(
+        [
+            1 if str(record.get("relative_name") or "").strip() else 0,
+            1 if str(record.get("gender") or "").strip() else 0,
+        ]
+    )
+
+    if primary_fields_present >= 2:
+        return "valid", ""
+    if primary_fields_present >= 1:
+        return "partial", "missing some key fields"
+    if secondary_fields_present >= 1:
+        return "partial", "only secondary fields parsed"
+    return "rejected", "missing minimum identity fields"
 
 
 def _parse_card_record(
     *,
-    card_text: str,
+    raw_card_text: str,
+    cleaned_card_text: str,
     file_name: str,
     file_path: str,
     page_number: int,
     constituency: str | None,
     section_name: str | None,
     extraction_method: str,
-) -> tuple[dict[str, Any] | None, str | None]:
-    normalized_text = card_text.replace("\r", "\n").strip()
-    if not normalized_text:
-        return None, "empty card text"
+) -> tuple[dict[str, Any] | None, str, str | None]:
+    if not cleaned_card_text.strip():
+        return None, "rejected", "empty card text after cleanup"
 
-    lowered = normalized_text.lower()
-    if "assembly constituency" in lowered and "elector" not in lowered:
-        return None, "header-only region"
-
-    serial_number = _extract_first(
+    serial_number = _parse_serial_number(cleaned_card_text)
+    elector_id = _parse_elector_id(cleaned_card_text)
+    name = _extract_labeled_value(
+        cleaned_card_text,
         [
-            r"(?im)^\s*(\d{1,5})\b",
-            r"(?im)\b(?:serial|sl\.?\s*no\.?)\b\s*[:\-]?\s*(\d{1,5})",
+            r"name of elector",
+            r"elector'?s name",
+            r"name",
+            r"नाम",
         ],
-        normalized_text,
     )
-    elector_id = _extract_first(
-        [
-            r"\b([A-Z]{2,4}\s?\d{6,12})\b",
-        ],
-        normalized_text,
-    ).replace(" ", "")
-    name = _extract_first(
-        [
-            r"(?im)\b(?:name of elector|elector'?s name|name)\b\s*[:\-]?\s*([^\n:]{2,140})",
-            r"(?im)\b(?:नाम)\b\s*[:\-]?\s*([^\n]{2,140})",
-        ],
-        normalized_text,
+    if not name:
+        name = _infer_card_name(cleaned_card_text, elector_id)
+    name = re.sub(
+        r"(?i)\b(?:father|mother|husband|wife)(?:'?s)?\s+name\b.*$",
+        "",
+        name,
     )
     name = _clean_card_field(name)
 
-    relative_match = re.search(
-        r"(?im)\b(Father'?s?|Mother'?s?|Husband'?s?|Wife'?s?|S/O|D/O|W/O)\b(?:\s*name)?\s*[:\-]?\s*([^\n]{2,140})",
-        normalized_text,
-    )
-    relative_type = ""
-    relative_name = ""
-    if relative_match:
-        relation_token = relative_match.group(1).strip().lower()
-        if relation_token in {"father", "father's", "s/o"}:
-            relative_type = "father"
-        elif relation_token in {"mother", "mother's", "d/o"}:
-            relative_type = "mother"
-        elif relation_token in {"husband", "husband's", "wife", "wife's", "w/o"}:
-            relative_type = "husband"
-        else:
-            relative_type = relation_token
-        relative_name = _clean_card_field(relative_match.group(2))
-
-    house_number = _extract_first(
-        [
-            r"(?im)\b(?:house\s*(?:no\.?|number)?|h\.?\s*no\.?)\b\s*[:\-]?\s*([^\n]{1,80})",
-        ],
-        normalized_text,
-    )
-    house_number = _clean_card_field(house_number)
-
-    age_value = _extract_first(
-        [
-            r"(?im)\b(?:age)\b\s*[:\-]?\s*(\d{1,3})",
-        ],
-        normalized_text,
-    )
-    age = int(age_value) if age_value.isdigit() else None
-
-    gender = _extract_first(
-        [
-            r"(?im)\b(?:gender|sex)\b\s*[:\-]?\s*(male|female|other|m|f)",
-            r"(?im)\b(male|female|other)\b",
-        ],
-        normalized_text,
-    ).lower()
-    if gender == "m":
-        gender = "male"
-    elif gender == "f":
-        gender = "female"
-
-    if not name:
-        name = _infer_card_name(normalized_text, elector_id)
-        name = _clean_card_field(name)
-
-    if not any([name, elector_id, relative_name, house_number, age]):
-        return None, "missing core voter fields"
-    if name and len(name.split()) > 12:
-        return None, "name looks like merged text"
+    relative_type, relative_name = _parse_relative_fields(cleaned_card_text)
+    relative_name = _clean_card_field(relative_name)
+    house_number = _parse_house_number(cleaned_card_text)
+    age, gender = _parse_age_and_gender(cleaned_card_text)
 
     parsed_record = {
         "serial_number": serial_number or None,
@@ -1067,9 +1551,13 @@ def _parse_card_record(
         "file_path": file_path,
         "page_number": int(page_number),
         "extraction_method": extraction_method,
-        "raw_record_text": normalized_text,
+        "raw_record_text": raw_card_text.replace("\r", "\n").strip(),
     }
-    return parsed_record, None
+    parse_status, reason = _classify_card_record(parsed_record)
+    if parse_status == "rejected":
+        return None, parse_status, reason
+    parsed_record["_parse_status"] = parse_status
+    return parsed_record, parse_status, reason or None
 
 
 def parse_voter_records_from_page_layout_aware(
@@ -1099,6 +1587,12 @@ def parse_voter_records_from_page_layout_aware(
         "cards_detected": 0,
         "cards_with_text": 0,
         "cards_parsed": 0,
+        "cards_valid": 0,
+        "cards_partial": 0,
+        "cards_rejected": 0,
+        "cards_inserted": 0,
+        "expected_card_count": 0,
+        "reject_reason_breakdown": {},
         "cards": [],
     }
 
@@ -1107,20 +1601,29 @@ def parse_voter_records_from_page_layout_aware(
         debug_payload["mode"] = "page_text_fallback"
         debug_payload["detection_error"] = render_error or "page image unavailable"
         debug_payload["cards_parsed"] = len(fallback_records)
+        debug_payload["cards_valid"] = len(fallback_records)
+        debug_payload["cards_partial"] = 0
         return {"records": fallback_records, "debug": debug_payload}
 
     boxes, detection_strategy, detection_error = _detect_voter_card_boxes(page_image)
     debug_payload["detection_strategy"] = detection_strategy
     debug_payload["detection_error"] = detection_error
     debug_payload["cards_detected"] = len(boxes)
+    if len(boxes) >= 18:
+        debug_payload["expected_card_count"] = 24
+    else:
+        debug_payload["expected_card_count"] = len(boxes)
     if not boxes:
         debug_payload["mode"] = "page_text_fallback"
         debug_payload["cards_parsed"] = len(fallback_records)
+        debug_payload["cards_valid"] = len(fallback_records)
+        debug_payload["cards_partial"] = 0
+        debug_payload["cards_rejected"] = max(0, int(debug_payload["cards_detected"]) - int(debug_payload["cards_parsed"]))
         return {"records": fallback_records, "debug": debug_payload}
 
     if not constituency or not section_name:
         header_crop = page_image.crop((0, 0, page_image.size[0], max(1, int(page_image.size[1] * 0.2))))
-        header_text, _ = _ocr_card_image(header_crop, timeout_seconds=min(float(ocr_timeout_seconds or 20), 8.0))
+        header_text, _, _ = _ocr_card_image(header_crop, timeout_seconds=min(float(ocr_timeout_seconds or 20), 8.0))
         header_constituency, header_section = _extract_context(header_text)
         constituency = constituency or header_constituency or None
         section_name = section_name or header_section or None
@@ -1130,12 +1633,14 @@ def parse_voter_records_from_page_layout_aware(
     for card_index, box in enumerate(boxes, start=1):
         x1, y1, x2, y2 = box
         card_image = page_image.crop((x1, y1, x2, y2))
-        card_text, ocr_error = _ocr_card_image(card_image, timeout_seconds=ocr_timeout_seconds)
-        if card_text.strip():
+        raw_card_text, ocr_error, ocr_meta = _ocr_card_image(card_image, timeout_seconds=ocr_timeout_seconds)
+        cleaned_card_text = _clean_card_ocr_text(raw_card_text)
+        if cleaned_card_text.strip():
             debug_payload["cards_with_text"] = int(debug_payload["cards_with_text"]) + 1
 
-        record, reject_reason = _parse_card_record(
-            card_text=card_text,
+        record, parse_status, reject_reason = _parse_card_record(
+            raw_card_text=raw_card_text,
+            cleaned_card_text=cleaned_card_text,
             file_name=file_name,
             file_path=file_path,
             page_number=page_number,
@@ -1143,18 +1648,33 @@ def parse_voter_records_from_page_layout_aware(
             section_name=section_name,
             extraction_method=f"card_ocr_{detection_strategy}",
         )
-        accepted = record is not None
+        accepted = parse_status in {"valid", "partial"} and record is not None
         if accepted:
             parsed_records.append(record)
+            if parse_status == "valid":
+                debug_payload["cards_valid"] = int(debug_payload.get("cards_valid", 0)) + 1
+            else:
+                debug_payload["cards_partial"] = int(debug_payload.get("cards_partial", 0)) + 1
+        else:
+            debug_payload["cards_rejected"] = int(debug_payload.get("cards_rejected", 0)) + 1
+            reason_key = (reject_reason or "rejected").strip() or "rejected"
+            reject_breakdown = dict(debug_payload.get("reject_reason_breakdown", {}))
+            reject_breakdown[reason_key] = int(reject_breakdown.get(reason_key, 0)) + 1
+            debug_payload["reject_reason_breakdown"] = reject_breakdown
 
         if include_card_debug:
             card_debug_entry: dict[str, Any] = {
                 "card_index": card_index,
                 "bbox": {"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2)},
                 "ocr_error": ocr_error,
+                "ocr_preprocess": (ocr_meta or {}).get("preprocess"),
                 "accepted": accepted,
                 "reject_reason": reject_reason,
-                "ocr_text": card_text.strip(),
+                "parse_status": parse_status,
+                "validation_status": parse_status,
+                "db_insert_status": "pending_insert" if accepted else "rejected_not_inserted",
+                "raw_ocr_text": raw_card_text.strip(),
+                "cleaned_ocr_text": cleaned_card_text,
                 "parsed_record": record,
             }
             if card_index <= max(1, int(max_preview_cards)):
@@ -1167,17 +1687,14 @@ def parse_voter_records_from_page_layout_aware(
             cards_debug.append(card_debug_entry)
 
     debug_payload["cards_parsed"] = len(parsed_records)
+    debug_payload["cards_valid"] = int(debug_payload.get("cards_valid", 0))
+    debug_payload["cards_partial"] = int(debug_payload.get("cards_partial", 0))
+    if "reject_reason_breakdown" not in debug_payload:
+        debug_payload["reject_reason_breakdown"] = {}
     debug_payload["cards"] = cards_debug
-    if parsed_records:
-        return {"records": parsed_records, "debug": debug_payload}
-
-    debug_payload["mode"] = "page_text_fallback"
-    if detection_error:
-        debug_payload["detection_error"] = detection_error
-    if not debug_payload["detection_error"]:
-        debug_payload["detection_error"] = "no valid card records parsed; fallback to page parser"
-    debug_payload["cards_parsed"] = len(fallback_records)
-    return {"records": fallback_records, "debug": debug_payload}
+    if not parsed_records and not debug_payload.get("detection_error"):
+        debug_payload["detection_error"] = "no valid card records parsed from detected card regions"
+    return {"records": parsed_records, "debug": debug_payload}
 
 
 def parse_voter_records_from_page(

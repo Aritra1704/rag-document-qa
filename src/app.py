@@ -1288,6 +1288,12 @@ def show_name_search_workflow():
                                     "cards_detected": 0,
                                     "cards_with_text": 0,
                                     "cards_parsed": 0,
+                                    "cards_valid": 0,
+                                    "cards_partial": 0,
+                                    "cards_rejected": 0,
+                                    "cards_inserted": 0,
+                                    "expected_card_count": 0,
+                                    "reject_reason_breakdown": {},
                                     "cards": [],
                                 }
 
@@ -1317,7 +1323,8 @@ def show_name_search_workflow():
                                     parsed_record_count=len(parsed_records),
                                     error_message=error_message or None,
                                 )
-                                if use_test_sampling and not test_replace_existing:
+                                force_replace_for_page = action_mode == "test_one_page" or bool(test_replace_existing)
+                                if use_test_sampling and not force_replace_for_page:
                                     insert_page_records(
                                         storage_connection,
                                         document_id=document_id,
@@ -1336,11 +1343,21 @@ def show_name_search_workflow():
                                         extraction_method=None,
                                     )
                                 inserted_count_for_page = len(parsed_records)
+                                card_layout_debug_payload["cards_inserted"] = int(inserted_count_for_page)
+                                if card_layout_debug_payload.get("cards"):
+                                    for card_debug_entry in card_layout_debug_payload["cards"]:
+                                        if bool(card_debug_entry.get("accepted")):
+                                            card_debug_entry["db_insert_status"] = "inserted"
                             except Exception as exc:  # noqa: BLE001
                                 test_run_stats["insert_errors"].append(
                                     f"{file_name_value} page {page_number_value}: {exc}"
                                 )
                                 inserted_count_for_page = 0
+                                card_layout_debug_payload["cards_inserted"] = 0
+                                if card_layout_debug_payload.get("cards"):
+                                    for card_debug_entry in card_layout_debug_payload["cards"]:
+                                        if bool(card_debug_entry.get("accepted")):
+                                            card_debug_entry["db_insert_status"] = "insert_failed"
 
                             state["pages_processed"] = int(state.get("pages_processed", 0)) + 1
                             try:
@@ -1556,6 +1573,12 @@ def show_name_search_workflow():
                             "cards_detected": int((card_layout_debug_payload or {}).get("cards_detected") or 0),
                             "cards_with_text": int((card_layout_debug_payload or {}).get("cards_with_text") or 0),
                             "cards_parsed": int((card_layout_debug_payload or {}).get("cards_parsed") or 0),
+                            "cards_valid": int((card_layout_debug_payload or {}).get("cards_valid") or 0),
+                            "cards_partial": int((card_layout_debug_payload or {}).get("cards_partial") or 0),
+                            "cards_rejected": int((card_layout_debug_payload or {}).get("cards_rejected") or 0),
+                            "cards_inserted": int((card_layout_debug_payload or {}).get("cards_inserted") or 0),
+                            "expected_card_count": int((card_layout_debug_payload or {}).get("expected_card_count") or 0),
+                            "reject_reason_breakdown": dict((card_layout_debug_payload or {}).get("reject_reason_breakdown") or {}),
                         }
                     else:
                         st.session_state.name_search_test_run_summary = None
@@ -1668,9 +1691,23 @@ def show_name_search_workflow():
             {"Metric": "Card detection strategy", "Value": str(test_run_summary.get("card_detection_strategy") or "")},
             {"Metric": "Cards detected", "Value": str(int(test_run_summary.get("cards_detected", 0)))},
             {"Metric": "Cards OCR text", "Value": str(int(test_run_summary.get("cards_with_text", 0)))},
-            {"Metric": "Cards parsed to records", "Value": str(int(test_run_summary.get("cards_parsed", 0)))},
+            {"Metric": "Cards parsed to records (valid+partial)", "Value": str(int(test_run_summary.get("cards_parsed", 0)))},
+            {"Metric": "Cards valid", "Value": str(int(test_run_summary.get("cards_valid", 0)))},
+            {"Metric": "Cards partial", "Value": str(int(test_run_summary.get("cards_partial", 0)))},
+            {"Metric": "Cards rejected", "Value": str(int(test_run_summary.get("cards_rejected", 0)))},
+            {"Metric": "Cards inserted", "Value": str(int(test_run_summary.get("cards_inserted", 0)))},
+            {"Metric": "Expected cards (hint)", "Value": str(int(test_run_summary.get("expected_card_count", 0)))},
         ]
         st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+
+        reject_reason_breakdown = dict(test_run_summary.get("reject_reason_breakdown") or {})
+        if reject_reason_breakdown:
+            with st.expander("Rejected card reasons"):
+                reason_rows = [
+                    {"Reason": reason, "Count": int(count)}
+                    for reason, count in sorted(reject_reason_breakdown.items(), key=lambda item: (-int(item[1]), item[0]))
+                ]
+                st.dataframe(reason_rows, use_container_width=True, hide_index=True)
 
         insert_errors = list(test_run_summary.get("insert_errors", []))
         if insert_errors:
@@ -1685,7 +1722,38 @@ def show_name_search_workflow():
             if detection_error:
                 st.caption(f"Detection note: {detection_error}")
 
-            preview_cards = list(card_layout_debug_payload.get("cards", []))[:5]
+            cards_detected_value = int(card_layout_debug_payload.get("cards_detected") or 0)
+            cards_parsed_value = int(card_layout_debug_payload.get("cards_parsed") or 0)
+            cards_valid_value = int(card_layout_debug_payload.get("cards_valid") or 0)
+            cards_partial_value = int(card_layout_debug_payload.get("cards_partial") or 0)
+            expected_cards_value = int(card_layout_debug_payload.get("expected_card_count") or 0)
+            if cards_detected_value >= 20 and cards_parsed_value < max(1, int(cards_detected_value * 0.6)):
+                st.warning(
+                    f"Card completeness warning: detected {cards_detected_value} cards but only "
+                    f"{cards_parsed_value} records (valid+partial) were parsed."
+                )
+            if expected_cards_value >= 20 and cards_parsed_value < max(1, int(expected_cards_value * 0.6)):
+                st.warning(
+                    f"Expected around {expected_cards_value} cards for this page layout, "
+                    f"but only {cards_parsed_value} records (valid+partial) were parsed."
+                )
+
+            st.caption(
+                f"Detected={cards_detected_value} | OCR text={int(card_layout_debug_payload.get('cards_with_text') or 0)} | "
+                f"Valid={cards_valid_value} | Partial={cards_partial_value} | "
+                f"Rejected={int(card_layout_debug_payload.get('cards_rejected') or 0)} | "
+                f"Inserted={int(card_layout_debug_payload.get('cards_inserted') or 0)}"
+            )
+
+            reject_reason_breakdown = dict(card_layout_debug_payload.get("reject_reason_breakdown") or {})
+            if reject_reason_breakdown:
+                reason_rows = [
+                    {"Reason": reason, "Count": int(count)}
+                    for reason, count in sorted(reject_reason_breakdown.items(), key=lambda item: (-int(item[1]), item[0]))
+                ]
+                st.dataframe(reason_rows, use_container_width=True, hide_index=True)
+
+            preview_cards = list(card_layout_debug_payload.get("cards", []))
             if preview_cards:
                 for card_debug in preview_cards:
                     card_index = int(card_debug.get("card_index") or 0)
@@ -1702,18 +1770,39 @@ def show_name_search_workflow():
                     if crop_bytes:
                         st.image(crop_bytes, caption=f"Card #{card_index} crop preview", width=280)
 
-                    ocr_text = str(card_debug.get("ocr_text") or "")
-                    if ocr_text:
-                        st.code(ocr_text, language="text")
+                    validation_status = str(card_debug.get("validation_status") or "")
+                    parse_status = str(card_debug.get("parse_status") or validation_status)
+                    reject_reason = str(card_debug.get("reject_reason") or "")
+                    db_insert_status = str(card_debug.get("db_insert_status") or "")
+                    ocr_preprocess = str(card_debug.get("ocr_preprocess") or "")
+                    status_parts = [
+                        f"parse: {parse_status or 'unknown'}",
+                        f"db: {db_insert_status or 'unknown'}",
+                    ]
+                    if ocr_preprocess:
+                        status_parts.append(f"ocr preprocess: {ocr_preprocess}")
+                    if reject_reason:
+                        status_parts.append(f"reject reason: {reject_reason}")
+                    st.caption(" | ".join(status_parts))
+
+                    raw_ocr_text = str(card_debug.get("raw_ocr_text") or "")
+                    cleaned_ocr_text = str(card_debug.get("cleaned_ocr_text") or "")
+                    if raw_ocr_text:
+                        st.markdown("Raw OCR text")
+                        st.code(raw_ocr_text, language="text")
                     else:
                         st.info("No OCR text for this card region.")
 
+                    if cleaned_ocr_text:
+                        st.markdown("Cleaned OCR text")
+                        st.code(cleaned_ocr_text, language="text")
+
                     parsed_record = card_debug.get("parsed_record")
                     if parsed_record:
+                        st.markdown("Parsed JSON")
                         st.json(parsed_record)
                     else:
-                        reject_reason = str(card_debug.get("reject_reason") or "not parsed")
-                        st.caption(f"Skipped card reason: {reject_reason}")
+                        st.caption(f"Skipped card reason: {reject_reason or 'not parsed'}")
             else:
                 st.info("No card-level debug rows captured for this page.")
 
