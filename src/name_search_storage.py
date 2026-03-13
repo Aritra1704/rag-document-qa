@@ -437,6 +437,175 @@ def get_folder_storage_summary(connection, folder_path: str) -> dict[str, int]:
     }
 
 
+def fetch_document_row_by_file_path(connection, *, file_path: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT
+            id,
+            folder_path,
+            file_name,
+            file_path,
+            pages_total,
+            pages_processed,
+            status,
+            error_message,
+            last_modified,
+            file_size,
+            last_processed_at,
+            created_at,
+            updated_at
+        FROM documents
+        WHERE file_path = %s
+        LIMIT 1
+        """,
+        (file_path,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def fetch_document_page_status_map(
+    connection,
+    *,
+    document_id: int,
+    start_page: int | None = None,
+    end_page: int | None = None,
+) -> dict[int, str]:
+    filters: list[str] = ["document_id = %s"]
+    params: list[Any] = [int(document_id)]
+    if start_page is not None:
+        filters.append("page_number >= %s")
+        params.append(int(start_page))
+    if end_page is not None:
+        filters.append("page_number <= %s")
+        params.append(int(end_page))
+    sql_query = (
+        "SELECT page_number, status FROM pages WHERE "
+        + " AND ".join(filters)
+        + " ORDER BY page_number"
+    )
+    rows = connection.execute(sql_query, tuple(params)).fetchall()
+    return {int(row["page_number"]): str(row["status"] or "") for row in rows}
+
+
+def count_document_pages_by_status(
+    connection,
+    *,
+    document_id: int,
+    statuses: Sequence[str],
+    start_page: int | None = None,
+    end_page: int | None = None,
+) -> int:
+    normalized_statuses = [str(status or "").strip() for status in statuses if str(status or "").strip()]
+    if not normalized_statuses:
+        return 0
+    filters: list[str] = ["document_id = %s", "status = ANY(%s)"]
+    params: list[Any] = [int(document_id), normalized_statuses]
+    if start_page is not None:
+        filters.append("page_number >= %s")
+        params.append(int(start_page))
+    if end_page is not None:
+        filters.append("page_number <= %s")
+        params.append(int(end_page))
+    row = connection.execute(
+        "SELECT COUNT(*) AS c FROM pages WHERE " + " AND ".join(filters),
+        tuple(params),
+    ).fetchone()
+    return int(row["c"]) if row else 0
+
+
+def get_ingestion_monitor_summary(connection, *, folder_path: str) -> dict[str, Any]:
+    docs_row = connection.execute(
+        """
+        SELECT
+            COUNT(*) AS total_files,
+            COUNT(*) FILTER (WHERE status = 'processed') AS completed_files,
+            COUNT(*) FILTER (WHERE status = 'processing') AS processing_files,
+            COUNT(*) FILTER (WHERE status = 'pending') AS pending_files,
+            COUNT(*) FILTER (WHERE status = 'failed') AS failed_files,
+            COUNT(*) FILTER (WHERE status = 'skipped') AS skipped_files,
+            COALESCE(SUM(pages_total), 0) AS pages_total_expected,
+            COALESCE(SUM(pages_processed), 0) AS pages_processed_reported
+        FROM documents
+        WHERE folder_path = %s
+        """,
+        (folder_path,),
+    ).fetchone()
+
+    pages_row = connection.execute(
+        """
+        SELECT
+            COUNT(*) AS pages_seen,
+            COUNT(*) FILTER (WHERE p.status = 'processed') AS pages_completed,
+            COUNT(*) FILTER (WHERE p.status = 'processing') AS pages_processing,
+            COUNT(*) FILTER (WHERE p.status = 'failed') AS pages_failed,
+            COUNT(*) FILTER (WHERE p.status = 'skipped') AS pages_skipped
+        FROM pages p
+        JOIN documents d ON d.id = p.document_id
+        WHERE d.folder_path = %s
+        """,
+        (folder_path,),
+    ).fetchone()
+
+    current_row = connection.execute(
+        """
+        SELECT
+            id,
+            file_name,
+            file_path,
+            pages_processed,
+            pages_total,
+            status,
+            updated_at
+        FROM documents
+        WHERE folder_path = %s
+          AND status = 'processing'
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        (folder_path,),
+    ).fetchone()
+
+    low_conf_row = connection.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM parsed_records r
+        JOIN documents d ON d.id = r.document_id
+        WHERE d.folder_path = %s
+          AND (
+              r.extraction_method ILIKE '%%|needs_review'
+              OR r.extraction_method ILIKE '%%|partial'
+          )
+        """,
+        (folder_path,),
+    ).fetchone()
+
+    docs = dict(docs_row) if docs_row else {}
+    pages = dict(pages_row) if pages_row else {}
+    low_conf = dict(low_conf_row) if low_conf_row else {}
+
+    return {
+        "documents": {
+            "total_files": int(docs.get("total_files", 0)),
+            "completed_files": int(docs.get("completed_files", 0)),
+            "processing_files": int(docs.get("processing_files", 0)),
+            "pending_files": int(docs.get("pending_files", 0)),
+            "failed_files": int(docs.get("failed_files", 0)),
+            "skipped_files": int(docs.get("skipped_files", 0)),
+            "pages_total_expected": int(docs.get("pages_total_expected", 0)),
+            "pages_processed_reported": int(docs.get("pages_processed_reported", 0)),
+        },
+        "pages": {
+            "pages_seen": int(pages.get("pages_seen", 0)),
+            "pages_completed": int(pages.get("pages_completed", 0)),
+            "pages_processing": int(pages.get("pages_processing", 0)),
+            "pages_failed": int(pages.get("pages_failed", 0)),
+            "pages_skipped": int(pages.get("pages_skipped", 0)),
+        },
+        "current_file": dict(current_row) if current_row else None,
+        "low_confidence_records": int(low_conf.get("c", 0)),
+    }
+
+
 def search_stored_records(
     connection,
     *,
@@ -745,6 +914,7 @@ def _extract_page_header_metadata(
     header_text, header_ocr_error, header_ocr_meta = _ocr_card_image(
         header_crop,
         timeout_seconds=min(float(ocr_timeout_seconds or 20), 8.0),
+        fast_mode=True,
     )
     constituency, section_name = _extract_context(header_text)
     part_number = _extract_part_number(header_text)
@@ -1426,7 +1596,12 @@ def _run_tesseract(image, *, timeout_seconds: float | None, config: str):
     ) or ""
 
 
-def _ocr_card_image(card_image, timeout_seconds: float | None) -> tuple[str, str | None, dict[str, Any]]:
+def _ocr_card_image(
+    card_image,
+    timeout_seconds: float | None,
+    *,
+    fast_mode: bool = False,
+) -> tuple[str, str | None, dict[str, Any]]:
     try:
         import pytesseract
     except Exception as exc:  # noqa: BLE001
@@ -1449,12 +1624,18 @@ def _ocr_card_image(card_image, timeout_seconds: float | None) -> tuple[str, str
 
     try:
         processed_text = _run_tesseract(preprocessed_image, timeout_seconds=timeout_seconds, config="--oem 1 --psm 6")
-        raw_text = _run_tesseract(card_image, timeout_seconds=timeout_seconds, config="--oem 1 --psm 11")
-        ocr_meta["attempts"] = [
-            {"source": "preprocessed", "config": "psm6", "score": _ocr_text_score(processed_text)},
-            {"source": "raw", "config": "psm11", "score": _ocr_text_score(raw_text)},
-        ]
-        text = processed_text if _ocr_text_score(processed_text) >= _ocr_text_score(raw_text) else raw_text
+        if fast_mode:
+            ocr_meta["attempts"] = [
+                {"source": "preprocessed", "config": "psm6", "score": _ocr_text_score(processed_text)},
+            ]
+            text = processed_text
+        else:
+            raw_text = _run_tesseract(card_image, timeout_seconds=timeout_seconds, config="--oem 1 --psm 11")
+            ocr_meta["attempts"] = [
+                {"source": "preprocessed", "config": "psm6", "score": _ocr_text_score(processed_text)},
+                {"source": "raw", "config": "psm11", "score": _ocr_text_score(raw_text)},
+            ]
+            text = processed_text if _ocr_text_score(processed_text) >= _ocr_text_score(raw_text) else raw_text
     except RuntimeError as exc:
         if "time" in str(exc).lower():
             timeout_display = int(timeout_seconds) if timeout_seconds else "configured"
@@ -1574,14 +1755,25 @@ def _split_card_zones(card_image):
     }
 
 
-def _ocr_card_zones(card_image, timeout_seconds: float | None) -> dict[str, Any]:
+def _ocr_card_zones(
+    card_image,
+    timeout_seconds: float | None,
+    *,
+    use_expensive_passes: bool = True,
+) -> dict[str, Any]:
     zones_payload = _split_card_zones(card_image)
-    serial_text, serial_error, serial_meta = _ocr_card_image(zones_payload["serial"], timeout_seconds=timeout_seconds)
+    serial_text = ""
+    serial_error = None
+    serial_meta: dict[str, Any] = {}
     serial_digits_text, serial_digits_error, serial_digits_preprocess = _ocr_digits_from_image(
         zones_payload["serial"],
         timeout_seconds=timeout_seconds,
     )
-    elector_text, elector_error, elector_meta = _ocr_card_image(zones_payload["elector_id"], timeout_seconds=timeout_seconds)
+    elector_text, elector_error, elector_verify_preprocess = _ocr_id_from_image(
+        zones_payload["elector_id"],
+        timeout_seconds=timeout_seconds,
+    )
+    elector_meta: dict[str, Any] = {"preprocess": elector_verify_preprocess}
     card_width, card_height = card_image.size
     top_micro_height = max(10, int(round(card_height * 0.22)))
     serial_micro_bbox = (
@@ -1596,17 +1788,45 @@ def _ocr_card_zones(card_image, timeout_seconds: float | None) -> dict[str, Any]
         card_width,
         min(card_height, top_micro_height),
     )
-    serial_micro_image = card_image.crop(serial_micro_bbox)
-    elector_micro_image = card_image.crop(elector_micro_bbox)
-    serial_verify_text, serial_verify_error, serial_verify_preprocess = _ocr_digits_from_image(
-        serial_micro_image,
+    serial_verify_text = str(serial_digits_text or "").strip()
+    serial_verify_error = serial_digits_error
+    serial_verify_preprocess = serial_digits_preprocess
+    elector_verify_text = str(elector_text or "").strip()
+    elector_verify_error = elector_error
+    body_text, body_error, body_meta = _ocr_card_image(
+        zones_payload["body"],
         timeout_seconds=timeout_seconds,
+        fast_mode=not use_expensive_passes,
     )
-    elector_verify_text, elector_verify_error, elector_verify_preprocess = _ocr_id_from_image(
-        elector_micro_image,
-        timeout_seconds=timeout_seconds,
-    )
-    body_text, body_error, body_meta = _ocr_card_image(zones_payload["body"], timeout_seconds=timeout_seconds)
+
+    if use_expensive_passes:
+        serial_text, serial_error, serial_meta = _ocr_card_image(
+            zones_payload["serial"],
+            timeout_seconds=timeout_seconds,
+        )
+        serial_micro_image = card_image.crop(serial_micro_bbox)
+        elector_micro_image = card_image.crop(elector_micro_bbox)
+        serial_verify_text, serial_verify_error, serial_verify_preprocess = _ocr_digits_from_image(
+            serial_micro_image,
+            timeout_seconds=timeout_seconds,
+        )
+        elector_verify_text, elector_verify_error, elector_verify_preprocess = _ocr_id_from_image(
+            elector_micro_image,
+            timeout_seconds=timeout_seconds,
+        )
+        elector_zone_text, elector_zone_error, elector_zone_meta = _ocr_card_image(
+            zones_payload["elector_id"],
+            timeout_seconds=timeout_seconds,
+        )
+        if elector_zone_text:
+            elector_text = elector_zone_text
+        if elector_zone_error and not elector_error:
+            elector_error = elector_zone_error
+        if elector_zone_meta:
+            elector_meta = elector_zone_meta
+    else:
+        # Fast path: use focused OCR outputs directly for top zones.
+        serial_text = str(serial_digits_text or "").strip()
 
     combined_text = "\n".join(
         [
@@ -1741,9 +1961,18 @@ def _is_valid_elector_id(value: str) -> bool:
     if not normalized:
         return False
     return bool(
-        re.fullmatch(r"[A-Z]{3}\d{6,12}", normalized)
-        or re.fullmatch(r"[A-Z]{2}/\d{1,4}/\d{1,4}/\d{3,10}", normalized)
+        re.fullmatch(r"[A-Z]{3}\d{6,10}", normalized)
+        or re.fullmatch(r"[A-Z]{2}/\d{2,3}/\d{2,3}/\d{4,8}", normalized)
     )
+
+
+def _elector_id_format(value: str) -> str:
+    normalized = str(value or "").strip().upper()
+    if re.fullmatch(r"[A-Z]{3}\d{6,10}", normalized):
+        return "compact"
+    if re.fullmatch(r"[A-Z]{2}/\d{2,3}/\d{2,3}/\d{4,8}", normalized):
+        return "slash"
+    return "invalid"
 
 
 def _is_junk_field_value(value: str) -> bool:
@@ -1913,14 +2142,14 @@ def _parse_elector_id(cleaned_text: str) -> str:
                 return ""
             numeric_suffix = suffix.translate(letter_to_digit)
             numeric_suffix = re.sub(r"\D", "", numeric_suffix)
-            if len(numeric_suffix) < 6:
+            if len(numeric_suffix) < 6 or len(numeric_suffix) > 10:
                 return ""
             return prefix + numeric_suffix
 
         compact_patterns = [
-            r"([A-Z0-9]{3})([0-9OILSB]{6,12})",
-            r"([A-Z0-9]{4})([0-9OILSB]{6,12})",
-            r"([A-Z0-9]{2})([0-9OILSB]{7,13})",
+            r"([A-Z0-9]{3})([0-9OILSB]{6,10})",
+            r"([A-Z0-9]{4})([0-9OILSB]{6,10})",
+            r"([A-Z0-9]{2})([0-9OILSB]{7,11})",
         ]
         for compact_pattern in compact_patterns:
             for compact_match in re.finditer(compact_pattern, compact_candidate):
@@ -1943,9 +2172,9 @@ def _parse_elector_id(cleaned_text: str) -> str:
 
     upper_text = cleaned_text.upper()
     patterns = [
-        r"([A-Z0-9]{2,5}\s*(?:[0-9OILSB]\s*){6,12})",
-        r"([A-Z0-9]{1,3}\s*/\s*[A-Z0-9]{1,4}\s*/\s*[A-Z0-9]{1,4}\s*/\s*[A-Z0-9]{2,10})",
-        r"([A-Z0-9]{1,3}\s*[-/]\s*[A-Z0-9]{5,12})",
+        r"([A-Z0-9]{2,5}\s*(?:[0-9OILSB]\s*){6,10})",
+        r"([A-Z0-9]{1,3}\s*/\s*[A-Z0-9]{2,3}\s*/\s*[A-Z0-9]{2,3}\s*/\s*[A-Z0-9]{4,8})",
+        r"([A-Z0-9]{1,3}\s*[-/]\s*[A-Z0-9]{6,10})",
     ]
     for pattern in patterns:
         for match in re.finditer(pattern, upper_text):
@@ -2317,12 +2546,14 @@ def _parse_card_record(
         "normalized_labels_detected": sorted(normalized_labels_detected),
         "serial_candidates": [],
         "elector_candidates": [],
+        "elector_raw_candidates": [],
         "serial_ocr_pass_a_raw": str(serial_zone_text or ""),
         "serial_ocr_pass_b_raw": str(serial_zone_verify_text or ""),
         "elector_ocr_pass_a_raw": str(elector_zone_text or ""),
         "elector_ocr_pass_b_raw": str(elector_zone_verify_text or ""),
         "serial_number_cleaned": None,
         "elector_id_cleaned": None,
+        "elector_id_format": "",
         "serial_confidence": "needs_review",
         "elector_confidence": "needs_review",
         "record_status": "needs_review",
@@ -2394,34 +2625,40 @@ def _parse_card_record(
     elector_id = ""
     elector_quality = "missing"
     elector_candidates: list[str] = []
-    elector_zone_candidate = _parse_elector_id(cleaned_elector_zone)
-    if elector_zone_candidate:
-        elector_id = elector_zone_candidate
-        elector_quality = "direct_zone_match"
-        elector_candidates.append(elector_zone_candidate)
-    if not elector_id:
-        elector_verify_candidate = _parse_elector_id(cleaned_elector_verify_zone)
-        if elector_verify_candidate:
-            elector_id = elector_verify_candidate
-            elector_quality = "direct_strong_match"
-            elector_candidates.append(elector_verify_candidate)
-    if not elector_id:
-        elector_card_candidate = _parse_elector_id(cleaned_card_text)
-        if elector_card_candidate:
-            elector_id = elector_card_candidate
-            elector_quality = "normalized_fuzzy_match"
-            elector_candidates.append(elector_card_candidate)
-    if not elector_id:
-        elector_body_candidate = _parse_elector_id(cleaned_body_zone)
-        if elector_body_candidate:
-            elector_id = elector_body_candidate
-            elector_quality = "fallback_inference"
-            elector_candidates.append(elector_body_candidate)
+    elector_raw_candidates: list[dict[str, str]] = []
+
+    def _consume_elector_source(source_name: str, source_text: str, quality_name: str) -> None:
+        nonlocal elector_id, elector_quality
+        raw_value = str(source_text or "")
+        if raw_value.strip():
+            elector_raw_candidates.append({"source": source_name, "raw": raw_value[:240]})
+        candidate_value = _parse_elector_id(raw_value)
+        if candidate_value:
+            if candidate_value not in elector_candidates:
+                elector_candidates.append(candidate_value)
+            elector_raw_candidates.append(
+                {
+                    "source": source_name,
+                    "raw": raw_value[:240],
+                    "normalized": candidate_value,
+                    "format": _elector_id_format(candidate_value),
+                }
+            )
+            if not elector_id:
+                elector_id = candidate_value
+                elector_quality = quality_name
+
+    _consume_elector_source("zone_pass_a", cleaned_elector_zone, "direct_zone_match")
+    _consume_elector_source("zone_pass_b", cleaned_elector_verify_zone, "direct_strong_match")
+    _consume_elector_source("full_card", cleaned_card_text, "normalized_fuzzy_match")
+    _consume_elector_source("body_zone", cleaned_body_zone, "fallback_inference")
     if elector_id and not _is_valid_elector_id(elector_id):
         elector_id = ""
         elector_quality = "invalid_rejected"
     parse_meta["elector_id_cleaned"] = elector_id or None
+    parse_meta["elector_id_format"] = _elector_id_format(elector_id) if elector_id else ""
     parse_meta["elector_candidates"] = elector_candidates
+    parse_meta["elector_raw_candidates"] = elector_raw_candidates
     field_quality["elector_id"] = elector_quality if elector_id else "missing"
 
     name = _extract_labeled_value_strict(
@@ -2701,6 +2938,9 @@ def parse_voter_records_from_page_layout_aware(
         "records_total_for_insert": 0,
         "serial_number_filled_count": 0,
         "elector_id_valid_count": 0,
+        "elector_id_compact_accepted_count": 0,
+        "elector_id_slash_accepted_count": 0,
+        "elector_id_trusted_count": 0,
         "gender_filled_count": 0,
         "records_partial_after_cleanup": 0,
         "trusted_records_count": 0,
@@ -2742,12 +2982,27 @@ def parse_voter_records_from_page_layout_aware(
         debug_payload["cards_rejected"] = 0
         return {"records": fallback_records, "debug": debug_payload}
 
-    header_payload = _extract_page_header_metadata(
-        page_image=page_image,
-        support_boxes=support_boxes,
-        ocr_timeout_seconds=ocr_timeout_seconds,
-        include_preview=bool(include_card_debug),
-    )
+    should_ocr_header = bool(include_card_debug) or not (str(constituency or "").strip() and str(section_name or "").strip())
+    if should_ocr_header:
+        header_payload = _extract_page_header_metadata(
+            page_image=page_image,
+            support_boxes=support_boxes,
+            ocr_timeout_seconds=ocr_timeout_seconds,
+            include_preview=bool(include_card_debug),
+        )
+    else:
+        header_payload = {
+            "bbox": {},
+            "ocr_text": "",
+            "ocr_error": None,
+            "ocr_preprocess": None,
+            "crop_png_bytes": None,
+            "metadata": {
+                "constituency": None,
+                "section_name": None,
+                "part_number": None,
+            },
+        }
     header_metadata = dict(header_payload.get("metadata") or {})
     header_constituency = str(header_metadata.get("constituency") or "").strip()
     header_section_name = str(header_metadata.get("section_name") or "").strip()
@@ -2782,6 +3037,16 @@ def parse_voter_records_from_page_layout_aware(
     cards_debug: list[dict[str, Any]] = []
     failed_slots: list[dict[str, Any]] = []
     retry_extra_top_ratio = _float_env("NAME_SEARCH_CARD_RETRY_TOP_EXTRA", 0.14, minimum=0.0, maximum=0.25)
+    use_expensive_zone_ocr = bool(include_card_debug)
+
+    def _confidence_score(confidence_value: str) -> int:
+        normalized_value = str(confidence_value or "").strip()
+        if normalized_value == "trusted":
+            return 2
+        if normalized_value == "low_confidence":
+            return 1
+        return 0
+
     for card_index, box in enumerate(slot_boxes, start=1):
         debug_payload["slots_ocr_attempted"] = int(debug_payload.get("slots_ocr_attempted", 0)) + 1
         original_x1, original_y1, original_x2, original_y2 = [int(value) for value in box]
@@ -2793,7 +3058,11 @@ def parse_voter_records_from_page_layout_aware(
         x1, y1, x2, y2 = expanded_box
         card_image = page_image.crop((x1, y1, x2, y2))
 
-        zone_ocr_payload = _ocr_card_zones(card_image, timeout_seconds=ocr_timeout_seconds)
+        zone_ocr_payload = _ocr_card_zones(
+            card_image,
+            timeout_seconds=ocr_timeout_seconds,
+            use_expensive_passes=use_expensive_zone_ocr,
+        )
         raw_card_text = str(zone_ocr_payload.get("combined_text") or "")
         ocr_error = zone_ocr_payload.get("combined_error")
         cleaned_card_text = _clean_card_ocr_text(raw_card_text)
@@ -2819,6 +3088,72 @@ def parse_voter_records_from_page_layout_aware(
             slot_index=card_index,
             expected_slots=len(slot_boxes),
         )
+        if not use_expensive_zone_ocr:
+            initial_rank = _parse_status_rank(parse_status)
+            initial_missing_count = len(missing_fields)
+            initial_conf_score = _confidence_score(parse_meta.get("serial_confidence")) + _confidence_score(
+                parse_meta.get("elector_confidence")
+            )
+            parsed_serial = str((record or {}).get("serial_number") or "").strip()
+            parsed_elector = str((record or {}).get("elector_id") or "").strip()
+            top_field_missing = bool({"serial_number", "elector_id", "name"} & set(missing_fields))
+            sensitive_fields_weak = (
+                parse_status in {"rejected_noise", "partial_top_missing", "partial_field_missing"}
+                or top_field_missing
+                or not parsed_serial
+                or not parsed_elector
+            )
+            if sensitive_fields_weak:
+                expensive_zone_ocr = _ocr_card_zones(
+                    card_image,
+                    timeout_seconds=ocr_timeout_seconds,
+                    use_expensive_passes=True,
+                )
+                expensive_raw_text = str(expensive_zone_ocr.get("combined_text") or "")
+                expensive_cleaned_text = _clean_card_ocr_text(expensive_raw_text)
+                expensive_record, expensive_status, expensive_reason, expensive_missing_fields, expensive_parse_meta = _parse_card_record(
+                    raw_card_text=expensive_raw_text,
+                    cleaned_card_text=expensive_cleaned_text,
+                    serial_zone_text=str(expensive_zone_ocr.get("serial_text") or ""),
+                    serial_zone_digits_text=str(expensive_zone_ocr.get("serial_digits_text") or ""),
+                    serial_zone_verify_text=str(expensive_zone_ocr.get("serial_verify_text") or ""),
+                    elector_zone_text=str(expensive_zone_ocr.get("elector_text") or ""),
+                    elector_zone_verify_text=str(expensive_zone_ocr.get("elector_verify_text") or ""),
+                    body_zone_text=str(expensive_zone_ocr.get("body_text") or ""),
+                    file_name=file_name,
+                    file_path=file_path,
+                    page_number=page_number,
+                    constituency=constituency,
+                    section_name=section_name,
+                    extraction_method=f"card_ocr_{detection_strategy}",
+                    slot_index=card_index,
+                    expected_slots=len(slot_boxes),
+                )
+                expensive_rank = _parse_status_rank(expensive_status)
+                expensive_conf_score = _confidence_score(expensive_parse_meta.get("serial_confidence")) + _confidence_score(
+                    expensive_parse_meta.get("elector_confidence")
+                )
+                use_expensive_result = (
+                    expensive_rank > initial_rank
+                    or (expensive_rank == initial_rank and len(expensive_missing_fields) < initial_missing_count)
+                    or (
+                        expensive_rank == initial_rank
+                        and len(expensive_missing_fields) == initial_missing_count
+                        and expensive_conf_score > initial_conf_score
+                    )
+                )
+                if use_expensive_result:
+                    record = expensive_record
+                    parse_status = expensive_status
+                    reject_reason = expensive_reason
+                    missing_fields = expensive_missing_fields
+                    parse_meta = expensive_parse_meta
+                    zone_ocr_payload = expensive_zone_ocr
+                    raw_card_text = expensive_raw_text
+                    cleaned_card_text = expensive_cleaned_text
+                    cleaned_body_text = _clean_card_ocr_text(str(expensive_zone_ocr.get("body_text") or ""))
+                    ocr_error = expensive_zone_ocr.get("combined_error")
+
         top_retry_attempted = False
         top_retry_used = False
         retry_expanded_box = expanded_box
@@ -2837,7 +3172,11 @@ def parse_voter_records_from_page_layout_aware(
             )
             if retry_expanded_box != expanded_box:
                 retry_card_image = page_image.crop(retry_expanded_box)
-                retry_zone_ocr = _ocr_card_zones(retry_card_image, timeout_seconds=ocr_timeout_seconds)
+                retry_zone_ocr = _ocr_card_zones(
+                    retry_card_image,
+                    timeout_seconds=ocr_timeout_seconds,
+                    use_expensive_passes=True,
+                )
                 retry_raw_text = str(retry_zone_ocr.get("combined_text") or "")
                 retry_cleaned_text = _clean_card_ocr_text(retry_raw_text)
                 retry_record, retry_status, retry_reason, retry_missing_fields, retry_parse_meta = _parse_card_record(
@@ -2944,8 +3283,10 @@ def parse_voter_records_from_page_layout_aware(
                 "body_zone_ocr_text": str(zone_ocr_payload.get("body_text") or ""),
                 "cleaned_serial_number": parse_meta.get("serial_number_cleaned"),
                 "cleaned_elector_id": parse_meta.get("elector_id_cleaned"),
+                "cleaned_elector_id_format": str(parse_meta.get("elector_id_format") or ""),
                 "serial_candidates": list(parse_meta.get("serial_candidates") or []),
                 "elector_candidates": list(parse_meta.get("elector_candidates") or []),
+                "elector_raw_candidates": list(parse_meta.get("elector_raw_candidates") or []),
                 "serial_confidence": str(parse_meta.get("serial_confidence") or ""),
                 "serial_confidence_reason": str(parse_meta.get("serial_confidence_reason") or ""),
                 "elector_confidence": str(parse_meta.get("elector_confidence") or ""),
@@ -2992,6 +3333,15 @@ def parse_voter_records_from_page_layout_aware(
     )
     debug_payload["elector_id_valid_count"] = sum(
         1 for record in parsed_records if _is_valid_elector_id(str(record.get("elector_id") or ""))
+    )
+    debug_payload["elector_id_compact_accepted_count"] = sum(
+        1 for record in parsed_records if _elector_id_format(str(record.get("elector_id") or "")) == "compact"
+    )
+    debug_payload["elector_id_slash_accepted_count"] = sum(
+        1 for record in parsed_records if _elector_id_format(str(record.get("elector_id") or "")) == "slash"
+    )
+    debug_payload["elector_id_trusted_count"] = sum(
+        1 for record in parsed_records if str(record.get("_elector_confidence") or "") == "trusted"
     )
     debug_payload["gender_filled_count"] = sum(
         1 for record in parsed_records if str(record.get("gender") or "").strip()

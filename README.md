@@ -174,7 +174,63 @@ Optional diagnostics (Live mode):
 - includes OCR fallback debug columns and quick one-file diagnostic (first 3 pages)
 - includes raw winner text block per page (first 500 chars)
 
-### 2.1) Quick 1-page PostgreSQL test (recommended before full run)
+### 2.2) Offline Batch Ingestion (recommended for full dataset)
+
+For full-folder ingestion, run the dedicated offline ingester instead of keeping Streamlit in a long OCR loop:
+
+```bash
+python -m src.ingest_rolls --folder "/absolute/path/to/pdfs"
+```
+
+Recommended baseline:
+
+```bash
+python -m src.ingest_rolls \
+  --folder "/absolute/path/to/pdfs" \
+  --workers 2 \
+  --start-page 3
+```
+
+Useful flags:
+
+- `--workers 1..4`: bounded concurrency (default `2`, capped to `4`)
+- `--start-page N` / `--end-page N`: page-range control
+- `--max-files N`: limit files for staged runs
+- `--disable-ocr-fallback`: disable OCR fallback path
+- `--no-resume`: disable checkpoint resume
+- `--no-reprocess-changed`: do not force full target-range reprocess for changed files
+- `--no-reprocess-failed`: skip retrying failed pages on resume
+
+Batch mode behavior:
+
+- discovers PDFs recursively
+- writes `documents` / `pages` checkpoints per file/page
+- parses and stores `parsed_records` using current schema
+- skips unchanged already-completed files using `file_path + last_modified + file_size`
+- resumes interrupted runs from pending pages
+- logs:
+  - files discovered/processed/skipped/failed
+  - pages attempted/skipped
+  - records inserted
+  - low-confidence record count
+  - elapsed time
+
+Low-confidence persistence in batch mode:
+
+- records classified as review-worthy are still inserted
+- review marker is preserved in `parsed_records.extraction_method` suffix:
+  - `|needs_review`
+  - `|partial`
+
+Streamlit integration for batch mode:
+
+- open `Workflow -> PDF Name Search -> Live Scan Search`
+- use `Offline Batch Ingestion (Recommended For Full Dataset)` panel
+- launch background batch ingestion from UI
+- monitor DB-backed progress metrics and current processing file
+- keep using one-page test mode for parser tuning
+
+### 2.3) Quick 1-page PostgreSQL test (recommended before full run)
 
 1. Open `Workflow -> PDF Name Search -> Live Scan Search`
 2. Keep `Test mode` ON
@@ -242,9 +298,9 @@ After run, UI shows:
 - Semantic fallback (for example with local models) when exact search finds nothing
 - Deeper integration with broader RAG/QA flow
 
-## CLI Entry Point
+## CLI Entry Points
 
-Run:
+Interactive name-search CLI:
 
 ```bash
 python3 -m src.name_finder
@@ -259,6 +315,12 @@ CLI prompts:
 
 Then prints grouped matches and saves `results.csv`.
 
+Offline batch ingestion CLI:
+
+```bash
+python3 -m src.ingest_rolls --folder "/absolute/path/to/pdfs"
+```
+
 ## Updated File Structure
 
 Key files for this feature:
@@ -266,6 +328,7 @@ Key files for this feature:
 - `src/app.py` (workflow switch, PDF Name Search UI, Local Ollama RAG UI)
 - `src/ollama_rag.py` (local Ollama diagnostics, embeddings, and chat helpers)
 - `src/name_finder.py` (folder scan, PDF page extraction, exact/semantic search, CSV export, CLI)
+- `src/ingest_rolls.py` (offline resumable batch ingestion CLI for full datasets)
 - `src/name_search_storage.py` (PostgreSQL storage adapter, OCR-text record parser, storage/search helpers)
 - `db/postgres/001_name_search_schema.sql` (PostgreSQL table creation)
 - `db/postgres/002_name_search_indexes.sql` (PostgreSQL indexes)

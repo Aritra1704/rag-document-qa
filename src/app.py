@@ -6,8 +6,10 @@ Enhanced with Demo Mode and Interactive UI
 import streamlit as st
 import anthropic
 from pathlib import Path
+from datetime import datetime
 import importlib.util
 import shutil
+import subprocess
 import sys
 # NumPy 2.x removed aliases used by chromadb==0.4.22; add a small compatibility shim
 # so the app can still start even before environment downgrade.
@@ -40,6 +42,7 @@ from name_finder import (
 from name_search_storage import (
     fetch_test_page_storage_verification,
     get_folder_storage_summary,
+    get_ingestion_monitor_summary,
     insert_page_records,
     open_storage_connection,
     parse_voter_records_from_page_layout_aware,
@@ -206,6 +209,24 @@ if 'name_search_test_verification_payload' not in st.session_state:
     st.session_state.name_search_test_verification_payload = None
 if 'name_search_test_card_layout_debug' not in st.session_state:
     st.session_state.name_search_test_card_layout_debug = None
+if 'name_search_ingestion_monitor' not in st.session_state:
+    st.session_state.name_search_ingestion_monitor = None
+if 'name_search_batch_workers' not in st.session_state:
+    st.session_state.name_search_batch_workers = 2
+if 'name_search_batch_max_files' not in st.session_state:
+    st.session_state.name_search_batch_max_files = 0
+if 'name_search_batch_resume' not in st.session_state:
+    st.session_state.name_search_batch_resume = True
+if 'name_search_batch_reprocess_changed' not in st.session_state:
+    st.session_state.name_search_batch_reprocess_changed = True
+if 'name_search_batch_reprocess_failed' not in st.session_state:
+    st.session_state.name_search_batch_reprocess_failed = True
+if 'name_search_batch_pid' not in st.session_state:
+    st.session_state.name_search_batch_pid = None
+if 'name_search_batch_log_path' not in st.session_state:
+    st.session_state.name_search_batch_log_path = ""
+if 'name_search_batch_last_command' not in st.session_state:
+    st.session_state.name_search_batch_last_command = ""
 if 'ollama_collection' not in st.session_state:
     st.session_state.ollama_collection = None
 if 'ollama_documents_processed' not in st.session_state:
@@ -1077,6 +1098,182 @@ def show_name_search_workflow():
         help="Show file/page-level extractor attempts to debug text extraction issues",
     )
 
+    with st.expander("Offline Batch Ingestion (Recommended For Full Dataset)", expanded=False):
+        st.caption(
+            "Use the offline CLI ingester for large runs. Streamlit remains for launch/monitor/search; "
+            "heavy OCR+parse loops run outside the interactive UI."
+        )
+        batch_col1, batch_col2 = st.columns(2)
+        batch_workers = int(
+            batch_col1.number_input(
+                "Batch workers",
+                min_value=1,
+                max_value=4,
+                value=int(st.session_state.get("name_search_batch_workers", 2)),
+                step=1,
+                key="name_search_batch_workers",
+                help="Recommended 2-4 workers for stable OCR throughput.",
+            )
+        )
+        batch_max_files = int(
+            batch_col2.number_input(
+                "Batch max files (0 = all)",
+                min_value=0,
+                value=int(st.session_state.get("name_search_batch_max_files", 0)),
+                step=1,
+                key="name_search_batch_max_files",
+            )
+        )
+        batch_opt_col1, batch_opt_col2, batch_opt_col3 = st.columns(3)
+        batch_resume = bool(
+            batch_opt_col1.checkbox(
+                "Resume",
+                value=bool(st.session_state.get("name_search_batch_resume", True)),
+                key="name_search_batch_resume",
+                help="Skip already completed pages/files and continue from checkpoints.",
+            )
+        )
+        batch_reprocess_changed = bool(
+            batch_opt_col2.checkbox(
+                "Reprocess changed files",
+                value=bool(st.session_state.get("name_search_batch_reprocess_changed", True)),
+                key="name_search_batch_reprocess_changed",
+            )
+        )
+        batch_reprocess_failed = bool(
+            batch_opt_col3.checkbox(
+                "Retry failed pages",
+                value=bool(st.session_state.get("name_search_batch_reprocess_failed", True)),
+                key="name_search_batch_reprocess_failed",
+            )
+        )
+
+        project_root = Path(__file__).resolve().parent.parent
+        command_preview = [
+            sys.executable,
+            "-m",
+            "src.ingest_rolls",
+            "--folder",
+            str(Path(folder_path).expanduser()) if folder_path.strip() else "<folder_path>",
+            "--start-page",
+            str(int(start_page)),
+            "--workers",
+            str(int(batch_workers)),
+            "--ocr-timeout",
+            str(float(ocr_timeout_seconds)),
+        ]
+        if end_page is not None:
+            command_preview.extend(["--end-page", str(int(end_page))])
+        if int(batch_max_files) > 0:
+            command_preview.extend(["--max-files", str(int(batch_max_files))])
+        if not enable_ocr_fallback:
+            command_preview.append("--disable-ocr-fallback")
+        if not batch_resume:
+            command_preview.append("--no-resume")
+        if not batch_reprocess_changed:
+            command_preview.append("--no-reprocess-changed")
+        if not batch_reprocess_failed:
+            command_preview.append("--no-reprocess-failed")
+        st.code(" ".join(command_preview), language="bash")
+
+        launch_col, refresh_col = st.columns(2)
+        launch_batch_clicked = launch_col.button("Launch Batch Ingestion (Background)")
+        refresh_monitor_clicked = refresh_col.button("Refresh Batch Monitor")
+
+        if launch_batch_clicked:
+            if not folder_path.strip():
+                st.warning("Provide a folder path before launching batch ingestion.")
+            else:
+                resolved_for_batch = Path(folder_path).expanduser()
+                if not resolved_for_batch.exists() or not resolved_for_batch.is_dir():
+                    st.error(f"Invalid folder path for batch ingestion: {resolved_for_batch}")
+                else:
+                    logs_dir = project_root / "logs"
+                    logs_dir.mkdir(parents=True, exist_ok=True)
+                    log_path = logs_dir / f"ingest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+                    command_to_run = list(command_preview)
+                    run_env = os.environ.copy()
+                    if db_path.strip():
+                        run_env["DATABASE_URL"] = db_path.strip()
+                    with log_path.open("ab") as log_handle:
+                        process = subprocess.Popen(  # noqa: S603
+                            command_to_run,
+                            cwd=str(project_root),
+                            env=run_env,
+                            stdout=log_handle,
+                            stderr=subprocess.STDOUT,
+                            start_new_session=True,
+                        )
+                    st.session_state.name_search_batch_pid = int(process.pid)
+                    st.session_state.name_search_batch_log_path = str(log_path)
+                    st.session_state.name_search_batch_last_command = " ".join(command_to_run)
+                    st.success(f"Batch ingestion started in background (PID {process.pid}).")
+
+        if refresh_monitor_clicked:
+            if not folder_path.strip():
+                st.warning("Provide a folder path to load ingestion monitor data.")
+            else:
+                try:
+                    monitor_connection = open_storage_connection(db_path.strip() or None)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Failed to load ingestion monitor: {exc}")
+                else:
+                    try:
+                        st.session_state.name_search_ingestion_monitor = get_ingestion_monitor_summary(
+                            monitor_connection,
+                            folder_path=resolved_folder_path,
+                        )
+                    finally:
+                        monitor_connection.close()
+
+        batch_pid = st.session_state.get("name_search_batch_pid")
+        batch_log_path = str(st.session_state.get("name_search_batch_log_path") or "")
+        batch_last_command = str(st.session_state.get("name_search_batch_last_command") or "")
+        if batch_pid:
+            st.caption(f"Last launched batch PID: {batch_pid}")
+        if batch_log_path:
+            st.caption(f"Batch log: {batch_log_path}")
+            log_file = Path(batch_log_path)
+            if log_file.exists():
+                log_lines = log_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if log_lines:
+                    st.markdown("Recent batch log lines")
+                    st.code("\n".join(log_lines[-20:]), language="text")
+        if batch_last_command:
+            st.caption("Last launch command")
+            st.code(batch_last_command, language="bash")
+
+        monitor_payload = st.session_state.get("name_search_ingestion_monitor")
+        if monitor_payload:
+            docs_metrics = dict(monitor_payload.get("documents") or {})
+            pages_metrics = dict(monitor_payload.get("pages") or {})
+            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+            metric_col1.metric("Total files", int(docs_metrics.get("total_files", 0)))
+            metric_col2.metric("Completed files", int(docs_metrics.get("completed_files", 0)))
+            metric_col3.metric("Completed pages", int(pages_metrics.get("pages_completed", 0)))
+            metric_col4.metric("Low-confidence records", int(monitor_payload.get("low_confidence_records", 0)))
+            st.caption(
+                "File states: "
+                + f"processing={int(docs_metrics.get('processing_files', 0))}, "
+                + f"pending={int(docs_metrics.get('pending_files', 0))}, "
+                + f"failed={int(docs_metrics.get('failed_files', 0))}, "
+                + f"skipped={int(docs_metrics.get('skipped_files', 0))}"
+            )
+            st.caption(
+                "Page states: "
+                + f"seen={int(pages_metrics.get('pages_seen', 0))}, "
+                + f"processing={int(pages_metrics.get('pages_processing', 0))}, "
+                + f"failed={int(pages_metrics.get('pages_failed', 0))}, "
+                + f"skipped={int(pages_metrics.get('pages_skipped', 0))}"
+            )
+            current_file_payload = monitor_payload.get("current_file")
+            if current_file_payload:
+                st.caption(
+                    "Current file: "
+                    + f"{current_file_payload.get('file_name', '')} "
+                    + f"({current_file_payload.get('pages_processed', 0)}/{current_file_payload.get('pages_total', 0)})"
+                )
+
     action_col1, action_col2, action_col3, action_col4 = st.columns(4)
     search_clicked = action_col1.button("Search PDFs", type="primary")
     process_store_clicked = action_col2.button("Process & Store")
@@ -1403,6 +1600,9 @@ def show_name_search_workflow():
                                     "records_total_for_insert": 0,
                                     "serial_number_filled_count": 0,
                                     "elector_id_valid_count": 0,
+                                    "elector_id_compact_accepted_count": 0,
+                                    "elector_id_slash_accepted_count": 0,
+                                    "elector_id_trusted_count": 0,
                                     "gender_filled_count": 0,
                                     "records_partial_after_cleanup": 0,
                                     "trusted_records_count": 0,
@@ -1708,6 +1908,9 @@ def show_name_search_workflow():
                             "records_total_for_insert": int((card_layout_debug_payload or {}).get("records_total_for_insert") or 0),
                             "serial_number_filled_count": int((card_layout_debug_payload or {}).get("serial_number_filled_count") or 0),
                             "elector_id_valid_count": int((card_layout_debug_payload or {}).get("elector_id_valid_count") or 0),
+                            "elector_id_compact_accepted_count": int((card_layout_debug_payload or {}).get("elector_id_compact_accepted_count") or 0),
+                            "elector_id_slash_accepted_count": int((card_layout_debug_payload or {}).get("elector_id_slash_accepted_count") or 0),
+                            "elector_id_trusted_count": int((card_layout_debug_payload or {}).get("elector_id_trusted_count") or 0),
                             "gender_filled_count": int((card_layout_debug_payload or {}).get("gender_filled_count") or 0),
                             "records_partial_after_cleanup": int((card_layout_debug_payload or {}).get("records_partial_after_cleanup") or 0),
                             "trusted_records_count": int((card_layout_debug_payload or {}).get("trusted_records_count") or 0),
@@ -1845,6 +2048,9 @@ def show_name_search_workflow():
             },
             {"Metric": "Serial number filled", "Value": str(int(test_run_summary.get("serial_number_filled_count", 0)))},
             {"Metric": "Elector ID valid", "Value": str(int(test_run_summary.get("elector_id_valid_count", 0)))},
+            {"Metric": "Elector ID compact accepted", "Value": str(int(test_run_summary.get("elector_id_compact_accepted_count", 0)))},
+            {"Metric": "Elector ID slash accepted", "Value": str(int(test_run_summary.get("elector_id_slash_accepted_count", 0)))},
+            {"Metric": "Elector ID trusted", "Value": str(int(test_run_summary.get("elector_id_trusted_count", 0)))},
             {"Metric": "Gender filled", "Value": str(int(test_run_summary.get("gender_filled_count", 0)))},
             {"Metric": "Records partial after cleanup", "Value": str(int(test_run_summary.get("records_partial_after_cleanup", 0)))},
             {"Metric": "Trusted records", "Value": str(int(test_run_summary.get("trusted_records_count", 0)))},
@@ -2011,8 +2217,10 @@ def show_name_search_workflow():
                     body_zone_ocr_text = str(card_debug.get("body_zone_ocr_text") or "")
                     cleaned_serial_number = str(card_debug.get("cleaned_serial_number") or "")
                     cleaned_elector_id = str(card_debug.get("cleaned_elector_id") or "")
+                    cleaned_elector_id_format = str(card_debug.get("cleaned_elector_id_format") or "")
                     serial_candidates = list(card_debug.get("serial_candidates") or [])
                     elector_candidates = list(card_debug.get("elector_candidates") or [])
+                    elector_raw_candidates = list(card_debug.get("elector_raw_candidates") or [])
                     serial_confidence = str(card_debug.get("serial_confidence") or "")
                     serial_confidence_reason = str(card_debug.get("serial_confidence_reason") or "")
                     elector_confidence = str(card_debug.get("elector_confidence") or "")
@@ -2053,7 +2261,7 @@ def show_name_search_workflow():
                         st.caption(
                             "Chosen sensitive fields: "
                             + f"serial_number={cleaned_serial_number or 'null'} ({serial_confidence or 'unknown'}) | "
-                            + f"elector_id={cleaned_elector_id or 'null'} ({elector_confidence or 'unknown'})"
+                            + f"elector_id={cleaned_elector_id or 'null'} [{cleaned_elector_id_format or 'unknown-format'}] ({elector_confidence or 'unknown'})"
                         )
                     if serial_confidence_reason or elector_confidence_reason:
                         st.caption(
@@ -2070,6 +2278,9 @@ def show_name_search_workflow():
                         st.caption("Serial candidates: " + ", ".join(str(value) for value in serial_candidates))
                     if elector_candidates:
                         st.caption("Elector candidates: " + ", ".join(str(value) for value in elector_candidates))
+                    if elector_raw_candidates:
+                        st.markdown("Elector raw candidate debug")
+                        st.json(elector_raw_candidates)
                     if normalized_labels_detected:
                         st.caption("Normalized labels: " + ", ".join(normalized_labels_detected))
                     if field_parse_quality:
